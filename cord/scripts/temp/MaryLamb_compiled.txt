@@ -1,0 +1,35 @@
+Script Compilation for: MaryLamb
+Generated: 1759247853
+
+================================================================================
+
+1. Recording: transcription_1759243955.txt
+   Script Position: 0
+   Match Score: 100.00%
+   Transcription: Mary had a little lamb, its fleece was white as snow.
+
+2. Recording: transcription_1759247536.txt
+   Script Position: 11
+   Match Score: 100.00%
+   Transcription: And everywhere that Mary went, the lamb was sure to go. It followed her to school one day, which was against the rule. It made the children laugh and play to see the lamb at school.
+
+3. Recording: transcription_1759244536.txt
+   Script Position: 11
+   Match Score: 50.00%
+   Transcription: And everywhere that Mary went, the land was sure to go. [BLANK_AUDIO]
+
+4. Recording: transcription_1759247598.txt
+   Script Position: 34
+   Match Score: 83.33%
+   Transcription: It made the children laugh and play to see the Lamet School.
+
+5. Recording: transcription_1759247792.txt
+   Script Position: 47
+   Match Score: 54.55%
+   Transcription: And so the teacher sent it out, but still it lingered near. Get stood and waited round about, till Mary did appear.
+
+6. Recording: transcription_1759247844.txt
+   Script Position: 69
+   Match Score: 100.00%
+   Transcription: Why does the lamb love Mary so the little children cry?
+
