@@ -1,0 +1,13 @@
+[package]
+name = "rustcorder"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+alsa = "0.6"
+hound = "3.4"
+ctrlc = "3.2"
+anyhow = "1.0"
+walkdir = "2.3"
+serde = { version = "1.0", features = ["derive"] }
+
