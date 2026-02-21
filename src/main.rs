@@ -98,42 +98,46 @@ fn choose_or_edit_session(mut sess: Session) -> Result<Session> {
     }
     Ok(sess)
 }
-
 fn detect_matching_cards() -> Result<Vec<u32>> {
     let mut matches = Vec::new();
     for entry in fs::read_dir("/sys/class/sound").context("reading /sys/class/sound")? {
         let e = entry?;
-        let file_name = e.file_name();
-        let name = file_name.to_string_lossy();
-        if name.starts_with("card") {
-            let card_path = e.path();
-            let device_link = card_path.join("device");
-            if !device_link.exists() {
-                continue;
-            }
-            let mut cur = device_link.clone();
-            let mut found = false;
-            for _ in 0..8 {
-                if cur.join("idVendor").exists() && cur.join("idProduct").exists() {
-                    let vid = fs::read_to_string(cur.join("idVendor"))?.trim().to_lowercase();
-                    let pid = fs::read_to_string(cur.join("idProduct"))?.trim().to_lowercase();
-                    if vid == VID && pid == PID {
-                        if let Some(s) = name.strip_prefix("card") {
-                            if let Ok(idx) = s.parse::<u32>() {
-                                matches.push(idx);
-                            }
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("card") {
+            continue;
+        }
+        let card_path = e.path();
+        let device_link = card_path.join("device");
+        if !device_link.exists() {
+            continue;
+        }
+
+        // Resolve symlink -> real device path under /sys/devices/...
+        let mut cur = match fs::canonicalize(&device_link) {
+            Ok(p) => p,
+            Err(_) => device_link.clone(),
+        };
+
+        // Walk upwards looking for idVendor/idProduct (USB parent)
+        for _ in 0..12 {
+            let idv = cur.join("idVendor");
+            let idp = cur.join("idProduct");
+            if idv.exists() && idp.exists() {
+                let vid = fs::read_to_string(idv)?.trim().to_lowercase();
+                let pid = fs::read_to_string(idp)?.trim().to_lowercase();
+                if vid == VID && pid == PID {
+                    if let Some(s) = name.strip_prefix("card") {
+                        if let Ok(idx) = s.parse::<u32>() {
+                            matches.push(idx);
                         }
                     }
-                    found = true;
-                    break;
                 }
-                if let Some(parent) = cur.parent() {
-                    cur = parent.to_path_buf();
-                } else {
-                    break;
-                }
+                break;
             }
-            if !found {
+            if let Some(parent) = cur.parent() {
+                cur = parent.to_path_buf();
+            } else {
+                break;
             }
         }
     }
@@ -184,12 +188,13 @@ fn compute_rms_dbfs(samples: &[i32]) -> f32 {
     }
     let mut sum_sq = 0f64;
     for &s in samples {
-        let f = s as f64 / (1i64 << 23) as f64;
+        let f = s as f64 / (1i64 << 23) as f64; // 24-bit full scale
         sum_sq += f * f;
     }
     let mean_sq = sum_sq / (samples.len() as f64);
     let rms = mean_sq.sqrt();
-    20.0 * (rms.max(1e-12)).log10()
+    let db = 20.0_f64 * (rms.max(1e-12)).log10();
+    db as f32
 }
 
 fn spawn_arecord(device: &str) -> Result<(std::process::Child, ChildStdout)> {
@@ -215,6 +220,7 @@ fn spawn_arecord(device: &str) -> Result<(std::process::Child, ChildStdout)> {
     Ok((child, stdout))
 }
 
+// Read 3-byte little-endian samples and convert into i32 (signed, 24-bit)
 fn read_samples_from_raw(reader: &mut dyn Read, buf_samples: &mut Vec<i32>, max_samples: usize) -> io::Result<usize> {
     buf_samples.clear();
     let mut bytes = vec![0u8; max_samples * 3];
@@ -232,6 +238,7 @@ fn read_samples_from_raw(reader: &mut dyn Read, buf_samples: &mut Vec<i32>, max_
         let b1 = bytes[i * 3 + 1] as u32;
         let b2 = bytes[i * 3 + 2] as u32;
         let val = (b2 << 16) | (b1 << 8) | b0;
+        // sign-extend 24-bit
         let signed = if (val & 0x800000) != 0 {
             (val | 0xff000000) as i32
         } else {
@@ -268,6 +275,7 @@ fn write_wav_stream(
         }
         let n = read_samples_from_raw(&mut stdout_reader, &mut buf, 4096)?;
         if n == 0 {
+            // arecord ended
             break;
         }
         let rms_db = compute_rms_dbfs(&buf);
@@ -283,6 +291,7 @@ fn write_wav_stream(
             writer.write_sample(s).ok();
         }
 
+        // simple activity indicator
         let active = rms_db > SILENCE_THRESHOLD_DBFS;
         let ind = if active { spinner[spin_i % spinner.len()] } else { "—" };
         print!(
@@ -305,6 +314,7 @@ fn write_wav_stream(
 
 fn pre_record_validation(device: &str) -> Result<()> {
     let (mut child, mut stdout_reader) = spawn_arecord(device)?;
+    // read PRE_RECORD_SECONDS worth of samples
     let samples_needed = (SAMPLE_RATE as usize) * (PRE_RECORD_SECONDS as usize);
     let mut buf: Vec<i32> = Vec::with_capacity(samples_needed);
     let mut total_read = 0usize;
@@ -313,6 +323,7 @@ fn pre_record_validation(device: &str) -> Result<()> {
         let n = read_samples_from_raw(&mut stdout_reader, &mut buf, samples_needed - total_read)?;
         total_read += n;
     }
+    // kill child
     let _ = child.kill();
     let rms_db = compute_rms_dbfs(&buf);
     if rms_db <= SILENCE_THRESHOLD_DBFS {
@@ -339,6 +350,7 @@ fn main() -> Result<()> {
     let device = card_to_alsa_device(card);
     println!("Using ALSA device: {}", device);
 
+    // main loop
     let stop_app = Arc::new(AtomicBool::new(false));
     let stop_flag = Arc::new(AtomicBool::new(false));
     let runtime_silence_warn = Arc::new(AtomicBool::new(false));
@@ -360,12 +372,14 @@ fn main() -> Result<()> {
             break;
         }
 
+        // ensure mic still present
         let matches = detect_matching_cards()?;
         if matches.len() != 1 {
             println!("FATAL: Approved microphone not present (or multiple). Aborting recording.");
             break;
         }
 
+        // pre-record validation
         match pre_record_validation(&device) {
             Ok(()) => {
                 println!("Pre-record validation passed.");
@@ -389,12 +403,16 @@ fn main() -> Result<()> {
             }
         });
 
+        // Wait for Enter or Ctrl-C to stop
         println!("Recording... press Enter to stop.");
         let mut dummy = String::new();
         io::stdin().read_line(&mut dummy).ok();
         stop_flag.store(true, Ordering::SeqCst);
 
+        // ensure arecord child is killed
+        // give writer some time to flush
         writer_thread.join().ok();
+        // ask user to continue chapter?
         loop {
             print!("Continue chapter? (Y/n): ");
             io::stdout().flush()?;
