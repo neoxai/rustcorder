@@ -1,3 +1,0 @@
-BOOK=TestBook
-CHAPTER=01
-PART=1
