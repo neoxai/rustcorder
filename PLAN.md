@@ -293,19 +293,7 @@ Notes:
 
 ---
 
-# PHASE 2 — (TBD)
 
-### Placeholder Goals
-
-Potential future features (not yet specified):
-
-* PipeWire-based monitoring
-* Real-time RMS / peak metering
-* ACX compliance analysis
-* Automated silence trimming
-* Chapter validation reports
-
----
 
 ## Appendix A — Device Identification & Enforcement (USB VID/PID Strategy)
 
@@ -536,3 +524,357 @@ Phase 1 produces a **trustworthy narration capture tool** whose primary value is
 > "If it recorded, it recorded the right mic, correctly labeled, with clean audio."
 
 Everything else can be layered later without compromising captured data.
+
+---
+
+---
+
+# PHASE 2 — Punch-and-Roll & Timeline Index
+
+## Goal
+
+Extend the recorder with the **punch-and-roll** technique used in professional audiobook narration, and introduce a **human-readable timeline index** that tracks every clip's position in the overall book recording as a single continuous timeline.
+
+No complex database. No audio editing. Files are never modified after recording — only metadata is added.
+
+---
+
+## Guiding Principles (Phase 2 additions)
+
+5. **The timeline is the source of truth for clip ordering and overlap**
+
+   * File timestamps and part numbers alone do not define playback order or splice points
+   * The timeline index file is the authoritative record
+
+6. **Files are immutable after recording**
+
+   * Punch-and-roll creates a new file; it never overwrites or truncates an existing file
+   * The old file remains intact on disk — the timeline marks it as partially superseded
+
+7. **The rollback and punch-in points are derived from measured data, not estimates**
+
+   * Clip duration is computed from bytes written (`data_bytes / byte_rate`)
+   * Elapsed playback time is measured from the moment playback begins
+
+---
+
+## Phase 2 Scope
+
+### Included
+
+* Timeline index file (one per chapter)
+* `TIMELINE_POS` field added to `session.save.txt`
+* Punch-and-roll workflow: stop → rewind N seconds → play → punch in → record
+* Configurable rewind duration via `PUNCH_BACK_TIME` environment variable (default: 15 s)
+* `.env` file in the repository root for local configuration
+* Playback via default ALSA PCM output (default device, no configuration)
+* New application states: `PunchRollback` and `PunchReady`
+* UI for rollback playback and punch-in waiting
+
+### Explicitly Excluded
+
+* Configurable playback output device (reserved for Phase 3)
+* Automatic assembly or mixdown of clips
+* Waveform display during rollback
+* Undo / redo beyond a single punch operation
+* Editing or trimming of existing files
+
+---
+
+## Core Concept: The Timeline Model
+
+All recorded clips for a chapter are treated as segments of a single continuous timeline. Each clip has an **absolute start position** in that timeline, measured in seconds from the beginning of the chapter.
+
+```
+Timeline (seconds):
+0         127.3     254.9
+│─────────────│─────────│──────────→
+  part001       part002    part003
+```
+
+A clip **owns** audio from its `START` until the earlier of:
+* Its own end (start + duration), or
+* The `START` of the next clip in the timeline
+
+If a later clip starts *before* the previous clip ends, the overlap region belongs exclusively to the later clip. This is the punch-in point — no audio surgery required.
+
+```
+Timeline with punch-in overlap:
+0              142.3
+│──────────────────────────────→  part001 (full duration)
+         127.3
+         │──────────────────────→  part002 (starts mid-part001)
+                                ↑
+         part001 is "owned" only up to 127.3 s
+         part002 owns everything from 127.3 s onward
+```
+
+---
+
+## Phase 2 Functional Requirements
+
+### 1. Timeline Index File
+
+#### Location
+
+```
+BookName/Chapter_01_timeline.txt
+```
+
+One file per chapter, stored in the same directory as the WAV files.
+
+#### Format
+
+```
+# rustcorder timeline — The_Hobbit / Chapter 01
+CLIP Chapter_01_part001.wav START=0.000
+CLIP Chapter_01_part002.wav START=127.342
+CLIP Chapter_01_part003.wav START=254.891
+```
+
+#### Rules
+
+* `#` lines are comments and are ignored during parsing
+* `CLIP` entries are in order of recording (not necessarily ascending `START` — a punch clip's START is less than the previous clip's end)
+* `START` is in seconds, three decimal places (millisecond precision)
+* A `CLIP` entry is appended at the **moment recording begins** for that clip, not at stop
+  * A crash mid-recording still leaves a valid (if short) entry
+* Entries are never deleted or rewritten — only appended
+
+#### Interpretation
+
+To reconstruct the canonical audio for a chapter:
+1. Sort clips by `START` ascending
+2. For each clip, take audio from `START` until `min(clip_end, next_clip.START)`
+3. If no next clip exists, take audio until clip end
+
+---
+
+### 2. Session State: `TIMELINE_POS` Field
+
+`session.save.txt` gains one new field:
+
+```
+BOOK=The_Hobbit
+CHAPTER=01
+PART=3
+TIMELINE_POS=254.891
+```
+
+* `TIMELINE_POS` is the absolute timeline position (seconds) at which the **most recently started** clip begins
+* It is updated:
+  * At start of each new recording (written immediately)
+  * After a normal stop: `TIMELINE_POS += clip_duration` — ready for the next clip
+  * After punch-and-roll: `TIMELINE_POS = punch_in_time` — set to the exact punch-in point
+* It is never decremented except by a punch-and-roll operation
+* If missing from a saved session (e.g. upgrading from Phase 1), it defaults to `0.0`
+
+---
+
+### 3. Punch-and-Roll Workflow
+
+#### Trigger
+
+* During active recording, user presses **`P`**
+
+#### Step-by-step behavior
+
+1. **Stop capture**: recording halts; WAV file is finalized
+2. **Compute rollback point**:
+   * `clip_duration = data_bytes / 144_000.0` (seconds)
+   * `punch_back_time = PUNCH_BACK_TIME env var (default: 15.0 s)`
+   * `rollback_offset = max(0.0, clip_duration - punch_back_time)` (seconds into the clip file)
+   * `rollback_abs = clip_start_timeline + rollback_offset` (absolute timeline position)
+3. **Begin playback** of the just-recorded file starting at `rollback_offset` seconds
+   * Output device: ALSA default PCM (`default`)
+   * No output device selection — uses whatever the OS considers default
+4. **Enter `PunchRollback` mode**: UI shows "ROLLING BACK... press SPACE to punch in"
+5. **User presses SPACE**: playback stops; elapsed playback time is recorded
+6. **Compute punch-in time**:
+   * `punch_in_time = rollback_abs + elapsed_since_playback_started`
+7. **Update state**:
+   * Increment part counter
+   * Set `TIMELINE_POS = punch_in_time`
+   * Save session
+8. **Append timeline entry**:
+   * `CLIP Chapter_NN_partNNN.wav START=<punch_in_time>`
+9. **Enter `PunchReady` mode**: briefly display punch-in time, then transition to `PreCheck` → `Recording`
+
+#### Escape / Abort during rollback
+
+* User presses **`Esc`** during `PunchRollback`: playback stops; state returns to `PostRecording` (normal stop prompt)
+* The partially-played rollback leaves no trace — no timeline entry is written until recording actually begins
+
+---
+
+### 4. Normal Recording Flow (updated)
+
+On normal start of recording (non-punch):
+
+1. Compute `clip_start = TIMELINE_POS` (current value from session)
+2. Append to timeline: `CLIP <filename> START=<clip_start>`
+3. Begin recording
+4. On stop: `TIMELINE_POS += clip_duration` → save session → `PostRecording` as before
+
+This ensures every clip, punch or not, has a timeline entry.
+
+---
+
+### 5. Application States (additions)
+
+Two new states are added to the `AppMode` enum:
+
+| State | Description |
+|---|---|
+| `PunchRollback` | Playback of the last 15 s is in progress; waiting for SPACE to punch in |
+| `PunchReady` | Punch-in time confirmed; transitioning to pre-check before new recording |
+
+Updated state machine (abbreviated):
+
+```
+Recording ──P──→ PunchRollback ──SPACE──→ PunchReady ──→ PreCheck ──→ Recording
+                      │
+                     ESC
+                      │
+                      ▼
+               PostRecording
+```
+
+---
+
+### 6. Environment Variable Configuration
+
+#### `.env` file
+
+A `.env` file in the repository root provides local defaults. It is loaded at application startup before any other initialization. Variables already set in the shell environment take precedence over the `.env` file.
+
+| Variable | Type | Default | Description |
+|---|---|---|---|
+| `PUNCH_BACK_TIME` | `f64` (seconds) | `15.0` | How far before the end of the current recording to begin rollback playback |
+
+#### Loading rules
+
+* The application reads `.env` from the **current working directory** at startup
+* If the file is absent, built-in defaults are used silently
+* If `PUNCH_BACK_TIME` is present but unparseable as a positive number, the application prints a warning and falls back to `15.0`
+* Minimum enforced value: `1.0` s (values below this are clamped and a warning is shown)
+* No maximum is enforced
+
+#### Implementation note
+
+Use the `dotenvy` crate (successor to `dotenv`) to load the file. It is a minimal, well-maintained crate with no transitive dependencies beyond `std`. Call `dotenvy::dotenv().ok()` early in `main()` — the `.ok()` discards the error silently when no `.env` file is present.
+
+---
+
+### 7. Playback Implementation
+
+
+#### Constraints
+
+* Output to ALSA `default` PCM device — no device selection in Phase 2
+* Read directly from the finalized WAV file (seek to `rollback_offset * byte_rate`)
+* Same fixed format as recording: 24-bit, 48 kHz, mono
+* Playback runs in a background thread (same pattern as capture), sending events to the main loop
+* Playback thread signals `PlaybackDone` when the file ends (in case the clip is shorter than 15 s)
+
+#### Output device note
+
+The `default` ALSA PCM device is used unconditionally. On most desktop Ubuntu systems this routes to PulseAudio/PipeWire and therefore the default speaker output. A future phase will allow the user to specify a preferred output device with a fallback priority list.
+
+---
+
+### 8. UI During Punch-and-Roll
+
+#### `PunchRollback` screen
+
+* Large text: **ROLLING BACK**
+* Playback position counter (e.g. `+3.2 s / 15.0 s` where 15.0 reflects `PUNCH_BACK_TIME`)
+* Filename being played
+* Instruction: `SPACE = punch in here   ESC = cancel`
+
+#### `PunchReady` screen (brief, ~1 s)
+
+* Large text: **PUNCHING IN**
+* Show the absolute punch-in timestamp: e.g. `Timeline position: 127.342 s`
+* Automatically transitions to `PreCheck`
+
+---
+
+## Phase 2 Technical Architecture
+
+### New / Modified Components
+
+| File | Change |
+|---|---|
+| `src/session.rs` | Add `timeline_pos: f64` to `Session`; load/save it; add `append_timeline_entry()` function |
+| `src/app.rs` | Add `AppMode::PunchRollback` and `AppMode::PunchReady`; add playback handle and punch-in timer fields; handle `P` key in `Recording` state; read `punch_back_time` from env at startup |
+| `src/audio.rs` | Add `start_playback(path, offset_secs)` function returning a `PlaybackHandle` with an event channel |
+| `src/render.rs` | Add rendering for `PunchRollback` and `PunchReady` states |
+| `.env` | New file — `PUNCH_BACK_TIME=15` (repository-level default; users may override in shell environment) |
+
+### No new crates required
+
+* WAV reading for playback uses the standard `std::fs::File` + `std::io::Seek` — same as `WavWriter` but in reverse
+* ALSA playback uses the existing `alsa` crate (write path instead of read path)
+
+---
+
+## Phase 2 Deliverables
+
+* `P` key triggers punch-and-roll during recording
+* Rollback plays the last 15 seconds (or full clip if shorter) to default speakers
+* `SPACE` during rollback sets the punch-in point and begins a new recording
+* `Chapter_NN_timeline.txt` is created and maintained automatically
+* `session.save.txt` tracks `TIMELINE_POS`
+* All existing Phase 1 behavior and guarantees remain intact
+
+---
+
+## Appendix C — Timeline File Interpretation Reference
+
+### C.1 Example: Three clean takes (no punch)
+
+```
+CLIP Chapter_01_part001.wav START=0.000
+CLIP Chapter_01_part002.wav START=142.317
+CLIP Chapter_01_part003.wav START=289.004
+```
+
+Canonical audio: part001[0→142.317 s] + part002[0→146.687 s] + part003[0→end]
+
+### C.2 Example: Punch-and-roll on second take
+
+```
+CLIP Chapter_01_part001.wav START=0.000
+CLIP Chapter_01_part002.wav START=127.342
+```
+
+`part001` duration: 142.317 s.
+`part001` owns: 0 → 127.342 s
+`part002` owns: 127.342 s → end
+
+Audio from `part001` between 127.342 s and 142.317 s is discarded in the final assembly.
+
+### C.3 Example: Two punches in succession
+
+```
+CLIP Chapter_01_part001.wav START=0.000
+CLIP Chapter_01_part002.wav START=127.342
+CLIP Chapter_01_part003.wav START=118.500
+```
+
+`part002` owns: 127.342 → 118.500 s — wait, this is *earlier* than part002's start.
+This means part003 punched *back into part001's* territory (user rolled back further than part002's start).
+Result: part001 owns 0 → 118.500 s; part003 owns 118.500 s → end; part002 is entirely superseded.
+
+The interpretation algorithm handles this correctly by always taking `min(clip_end, next_clip.START)`.
+
+---
+
+## Non-Goals (Phase 2 Explicit)
+
+* Configurable playback output device (Phase 3)
+* Waveform scrubbing or variable rewind duration (configurable in a future phase)
+* Timeline visualization in the TUI
+* Automatic mixdown or export
+* Undo of a completed punch (the old file still exists; the user can manually edit the timeline file)
