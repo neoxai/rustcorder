@@ -84,6 +84,8 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         AppMode::PreCheck => Span::styled("[ CHECKING ]", bold(YELLOW)),
         AppMode::Recording => Span::styled("[ *** RECORDING *** ]", bold(RED)),
         AppMode::PostRecording => Span::styled("[ STOPPED ]", bold(YELLOW)),
+        AppMode::PunchRollback => Span::styled("[ ROLLING BACK ]", bold(YELLOW)),
+        AppMode::PunchReady => Span::styled("[ PUNCHING IN ]", bold(GREEN)),
         AppMode::MicError => Span::styled("[ MIC ERROR ]", bold(RED)),
         AppMode::Fatal => Span::styled("[ FATAL ERROR ]", bold(RED)),
     };
@@ -163,6 +165,8 @@ fn draw_body(f: &mut Frame, app: &App, area: Rect) {
         AppMode::PreCheck => draw_precheck(f, app, area),
         AppMode::Recording => draw_recording(f, app, area),
         AppMode::PostRecording => draw_post_recording(f, app, area),
+        AppMode::PunchRollback => draw_punch_rollback(f, app, area),
+        AppMode::PunchReady => draw_punch_ready(f, app, area),
         AppMode::MicError => draw_mic_error(f, app, area),
         AppMode::Fatal => draw_fatal(f, app, area),
     }
@@ -250,6 +254,7 @@ fn draw_ready(f: &mut Frame, app: &App, area: Rect) {
             Constraint::Length(2), // mic info
             Constraint::Length(1), // blank
             Constraint::Length(1), // next file
+            Constraint::Length(1), // timeline pos
             Constraint::Length(1), // blank
             Constraint::Length(2), // status msg
             Constraint::Min(0),
@@ -280,13 +285,23 @@ fn draw_ready(f: &mut Frame, app: &App, area: Rect) {
     ]);
     f.render_widget(Paragraph::new(file_line), chunks[2]);
 
+    // Timeline position
+    let tl_line = Line::from(vec![
+        Span::styled("Timeline:   ", dim()),
+        Span::styled(
+            format!("{:.3} s", app.session.timeline_pos),
+            Style::default().fg(DARK_GRAY),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(tl_line), chunks[3]);
+
     // Status/warning message
     if let Some(ref msg) = app.status_msg {
         f.render_widget(
             Paragraph::new(msg.as_str())
                 .style(bold(YELLOW))
                 .wrap(Wrap { trim: true }),
-            chunks[4],
+            chunks[5],
         );
     }
 }
@@ -477,6 +492,102 @@ fn draw_post_recording(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
+// ── Punch rollback ────────────────────────────────────────────────────────────
+
+fn draw_punch_rollback(f: &mut Frame, app: &App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // ROLLING BACK banner
+            Constraint::Length(1), // blank
+            Constraint::Length(1), // playback counter
+            Constraint::Length(1), // file being played
+            Constraint::Length(1), // blank
+            Constraint::Length(1), // abs timeline pos
+            Constraint::Min(0),
+        ])
+        .split(area);
+
+    // Banner
+    let banner = Paragraph::new(Line::from(Span::styled(
+        "  ◀◀  ROLLING BACK  ◀◀  ",
+        Style::default()
+            .fg(Color::Black)
+            .bg(YELLOW)
+            .add_modifier(Modifier::BOLD),
+    )))
+    .alignment(Alignment::Center);
+    f.render_widget(banner, chunks[0]);
+
+    // Playback counter
+    let elapsed = app.playback_elapsed_secs();
+    let total = app.punch_back_time.min(app.last_clip_duration);
+    let done_tag = if app.playback_done {
+        Span::styled("  (end of clip)", dim())
+    } else {
+        Span::raw("")
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("  Playback: ", dim()),
+            Span::styled(
+                format!("+{:.1} s / {:.1} s", elapsed, total),
+                bold(WHITE),
+            ),
+            done_tag,
+        ])),
+        chunks[2],
+    );
+
+    // File being played
+    if let Some(ref path) = app.active_file {
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("  File:     ", dim()),
+                Span::styled(path.display().to_string(), Style::default().fg(CYAN)),
+            ])),
+            chunks[3],
+        );
+    }
+
+    // Absolute timeline position of the rollback start
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("  Rollback: ", dim()),
+            Span::styled(
+                format!("{:.3} s (absolute)", app.punch_rollback_abs),
+                Style::default().fg(DARK_GRAY),
+            ),
+        ])),
+        chunks[5],
+    );
+}
+
+// ── Punch ready ───────────────────────────────────────────────────────────────
+
+fn draw_punch_ready(f: &mut Frame, app: &App, area: Rect) {
+    let lines = vec![
+        Line::from(Span::styled(
+            "  ●  PUNCHING IN  ●  ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(GREEN)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::raw("")),
+        Line::from(vec![
+            Span::styled("  Timeline position: ", dim()),
+            Span::styled(
+                format!("{:.3} s", app.session.timeline_pos),
+                bold(CYAN),
+            ),
+        ]),
+        Line::from(Span::raw("")),
+        Line::from(Span::styled("Starting signal check…", dim())),
+    ];
+    f.render_widget(Paragraph::new(lines), area);
+}
+
 // ── Mic error ─────────────────────────────────────────────────────────────────
 
 fn draw_mic_error(f: &mut Frame, app: &App, area: Rect) {
@@ -537,8 +648,10 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         AppMode::Setup => "[Enter] Confirm   [Tab] Switch field   [Esc] Cancel",
         AppMode::Ready => "[Space] Start recording   [E] Edit session   [R] Re-detect mic   [Q] Quit",
         AppMode::PreCheck => "[Esc] Abort check",
-        AppMode::Recording => "[Space] Stop recording",
+        AppMode::Recording => "[Space] Stop   [P] Punch and roll",
         AppMode::PostRecording => "[Y/Enter] Continue chapter   [N] Chapter complete",
+        AppMode::PunchRollback => "[Space] Punch in here   [Esc] Cancel",
+        AppMode::PunchReady => "[Esc] Cancel",
         AppMode::MicError => "[R] Retry detection   [Q] Quit",
         AppMode::Fatal => "[Q] Quit",
     };

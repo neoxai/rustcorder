@@ -1,21 +1,30 @@
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::Result;
 
 const SESSION_FILE: &str = "session.save.txt";
 
-/// Persistent recording session: book name, current chapter, current part.
+/// Bytes per second for our fixed capture format (48 kHz, mono, 24-bit).
+const BYTE_RATE: f64 = 144_000.0;
+
+/// Persistent recording session: book name, current chapter, current part,
+/// and the absolute timeline position (in seconds) within the current chapter.
 #[derive(Debug, Clone)]
 pub struct Session {
     pub book: String,
     pub chapter: u32,
     pub part: u32,
+    /// Absolute timeline position (seconds from chapter start) where the next
+    /// recording clip should begin.  Updated after each clip stops or a
+    /// punch-in point is confirmed.
+    pub timeline_pos: f64,
 }
 
 impl Session {
     pub fn new(book: String, chapter: u32) -> Self {
-        Session { book, chapter, part: 1 }
+        Session { book, chapter, part: 1, timeline_pos: 0.0 }
     }
 
     /// Directory where recordings for this book are stored: `$PWD/<book>/`
@@ -37,10 +46,11 @@ impl Session {
         self.part += 1;
     }
 
-    /// Mark the chapter complete: bump chapter, reset part to 1.
+    /// Mark the chapter complete: bump chapter, reset part and timeline position.
     pub fn advance_chapter(&mut self) {
         self.chapter += 1;
         self.part = 1;
+        self.timeline_pos = 0.0;
     }
 
     /// Ensure the output directory exists.
@@ -57,6 +67,33 @@ impl Session {
         }
         self.current_path()
     }
+
+    /// Compute the duration in seconds from a raw WAV data byte count.
+    pub fn duration_from_bytes(data_bytes: u32) -> f64 {
+        data_bytes as f64 / BYTE_RATE
+    }
+
+    /// Append a CLIP entry to this chapter's timeline index file.
+    ///
+    /// The file is created with a header comment on first write.  Entries are
+    /// always appended — never overwritten — so a crash mid-recording still
+    /// leaves a valid (if short) entry.
+    pub fn append_timeline_entry(&self, filename: &str, start: f64) -> Result<()> {
+        let path = self
+            .output_dir()
+            .join(format!("Chapter_{:02}_timeline.txt", self.chapter));
+        let is_new = !path.exists();
+        let mut file = fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        if is_new {
+            writeln!(
+                file,
+                "# rustcorder timeline — {} / Chapter {:02}",
+                self.book, self.chapter
+            )?;
+        }
+        writeln!(file, "CLIP {} START={:.3}", filename, start)?;
+        Ok(())
+    }
 }
 
 // ── Persistence ──────────────────────────────────────────────────────────────
@@ -67,6 +104,7 @@ pub fn load() -> Option<Session> {
     let mut book = None;
     let mut chapter: Option<u32> = None;
     let mut part: Option<u32> = None;
+    let mut timeline_pos: f64 = 0.0;
 
     for line in content.lines() {
         if let Some(v) = line.strip_prefix("BOOK=") {
@@ -75,6 +113,8 @@ pub fn load() -> Option<Session> {
             chapter = v.trim().parse().ok();
         } else if let Some(v) = line.strip_prefix("PART=") {
             part = v.trim().parse().ok();
+        } else if let Some(v) = line.strip_prefix("TIMELINE_POS=") {
+            timeline_pos = v.trim().parse().unwrap_or(0.0);
         }
     }
 
@@ -82,13 +122,14 @@ pub fn load() -> Option<Session> {
         book: book?,
         chapter: chapter?,
         part: part?,
+        timeline_pos,
     })
 }
 
 pub fn save(session: &Session) -> Result<()> {
     let content = format!(
-        "BOOK={}\nCHAPTER={:02}\nPART={}\n",
-        session.book, session.chapter, session.part
+        "BOOK={}\nCHAPTER={:02}\nPART={}\nTIMELINE_POS={:.3}\n",
+        session.book, session.chapter, session.part, session.timeline_pos
     );
     fs::write(SESSION_FILE, content)?;
     Ok(())

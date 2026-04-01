@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::audio::{
-    self, AudioEvent, CaptureHandle, PRECHECK_SECONDS, SAMPLE_RATE,
+    self, AudioEvent, CaptureHandle, PlaybackHandle, PRECHECK_SECONDS, SAMPLE_RATE,
     SILENCE_THRESHOLD_DB, SILENCE_WARNING_SECONDS,
 };
 use crate::device::{self, MicDevice};
@@ -25,6 +25,11 @@ pub enum AppMode {
     Recording,
     /// Just stopped — prompting "continue chapter? (Y/n)"
     PostRecording,
+    /// Playing back the last N seconds of the just-recorded clip so the user
+    /// can find the punch-in point.
+    PunchRollback,
+    /// Punch-in time confirmed; briefly displayed before transitioning to PreCheck.
+    PunchReady,
     /// Approved mic is missing or was unplugged.
     MicError,
     /// Unrecoverable error (ALSA failure, disk full, etc.).
@@ -77,6 +82,27 @@ pub struct App {
     // ── Recording timing ──────────────────────────────────────────────────
     pub record_start: Option<Instant>,
 
+    // ── Phase 2: punch-and-roll ───────────────────────────────────────────
+    /// How far back (seconds) to rewind before rollback playback.
+    /// Loaded from PUNCH_BACK_TIME env var; defaults to 15.0.
+    pub punch_back_time: f64,
+    /// Absolute timeline position (seconds) when the current/last clip started.
+    pub clip_start_timeline: f64,
+    /// Duration (seconds) of the clip that triggered a punch operation.
+    pub last_clip_duration: f64,
+    /// Absolute timeline position where rollback playback began.
+    pub punch_rollback_abs: f64,
+    /// Active playback thread handle (Some during PunchRollback).
+    pub playback: Option<PlaybackHandle>,
+    /// When playback started (used to compute elapsed and punch-in time).
+    pub playback_start: Option<Instant>,
+    /// True once the playback thread has signalled PlaybackEvent::Done.
+    pub playback_done: bool,
+    /// Elapsed seconds at the moment PlaybackEvent::Done was received.
+    pub playback_elapsed: f64,
+    /// When PunchReady mode was entered (for auto-transition to PreCheck).
+    pub punch_ready_at: Option<Instant>,
+
     // ── Status / error messages ───────────────────────────────────────────
     pub status_msg: Option<String>,
     pub error_msg: String,
@@ -102,6 +128,13 @@ impl App {
         let setup_book = session.book.clone();
         let setup_chapter = format!("{:02}", session.chapter);
 
+        // Read PUNCH_BACK_TIME from environment (already loaded from .env by main).
+        let punch_back_time = std::env::var("PUNCH_BACK_TIME")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(15.0)
+            .max(1.0); // enforce minimum of 1 second
+
         App {
             session,
             mode,
@@ -121,6 +154,15 @@ impl App {
             precheck_signal_found: false,
             precheck_target_frames: (PRECHECK_SECONDS * SAMPLE_RATE as f64) as usize,
             record_start: None,
+            punch_back_time,
+            clip_start_timeline: 0.0,
+            last_clip_duration: 0.0,
+            punch_rollback_abs: 0.0,
+            playback: None,
+            playback_start: None,
+            playback_done: false,
+            playback_elapsed: 0.0,
+            punch_ready_at: None,
             status_msg: None,
             error_msg: String::new(),
             unsafe_mode,
@@ -171,6 +213,8 @@ impl App {
             AppMode::PreCheck => self.handle_key_precheck(key),
             AppMode::Recording => self.handle_key_recording(key),
             AppMode::PostRecording => self.handle_key_post(key),
+            AppMode::PunchRollback => self.handle_key_punch_rollback(key),
+            AppMode::PunchReady => self.handle_key_punch_ready(key),
             AppMode::MicError => self.handle_key_mic_error(key),
             AppMode::Fatal => {
                 if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
@@ -246,9 +290,11 @@ impl App {
         if let Some(saved) = session::load() {
             if saved.book != self.session.book || saved.chapter != self.session.chapter {
                 self.session.part = 1;
+                self.session.timeline_pos = 0.0;
             }
         } else {
             self.session.part = 1;
+            self.session.timeline_pos = 0.0;
         }
 
         let _ = session::save(&self.session);
@@ -284,8 +330,10 @@ impl App {
     }
 
     fn handle_key_recording(&mut self, key: KeyEvent) {
-        if matches!(key.code, KeyCode::Char(' ') | KeyCode::Enter) {
-            self.stop_recording();
+        match key.code {
+            KeyCode::Char(' ') | KeyCode::Enter => self.stop_recording(),
+            KeyCode::Char('p') | KeyCode::Char('P') => self.begin_punch(),
+            _ => {}
         }
     }
 
@@ -303,7 +351,7 @@ impl App {
             }
             KeyCode::Char('n') | KeyCode::Char('N') => {
                 // Chapter complete.
-                self.session.advance_chapter();
+                self.session.advance_chapter(); // also resets timeline_pos
                 let _ = session::save(&self.session);
                 self.status_msg = Some(format!(
                     "Chapter complete. Ready for Chapter {:02}.",
@@ -312,6 +360,23 @@ impl App {
                 self.mode = AppMode::Ready;
             }
             _ => {}
+        }
+    }
+
+    fn handle_key_punch_rollback(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char(' ') | KeyCode::Enter => self.punch_in(),
+            KeyCode::Esc | KeyCode::Char('q') => self.abort_punch_rollback(),
+            _ => {}
+        }
+    }
+
+    fn handle_key_punch_ready(&mut self, key: KeyEvent) {
+        // Allow aborting the punch before the auto-transition fires.
+        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+            self.punch_ready_at = None;
+            self.mode = AppMode::PostRecording;
+            self.status_msg = Some("Punch-and-roll cancelled.".into());
         }
     }
 
@@ -387,6 +452,24 @@ impl App {
 
                 match WavWriter::new(&path) {
                     Ok(wav) => {
+                        // Snapshot the clip's timeline start position.
+                        self.clip_start_timeline = self.session.timeline_pos;
+
+                        // Append timeline entry now (before audio is written)
+                        // so a crash still leaves a valid record.
+                        let filename = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        if let Err(e) = self.session.append_timeline_entry(
+                            &filename,
+                            self.clip_start_timeline,
+                        ) {
+                            // Non-fatal: warn but do not abort recording.
+                            self.status_msg =
+                                Some(format!("Warning: could not write timeline: {}", e));
+                        }
+
                         self.active_file = Some(path);
                         self.wav = Some(wav);
                         self.capture = Some(handle);
@@ -411,6 +494,13 @@ impl App {
     }
 
     fn stop_recording(&mut self) {
+        // Capture clip duration before dropping the WavWriter.
+        let duration = self
+            .wav
+            .as_ref()
+            .map(|w| Session::duration_from_bytes(w.data_bytes()))
+            .unwrap_or(0.0);
+
         if let Some(handle) = self.capture.take() {
             handle.stop();
         }
@@ -421,8 +511,107 @@ impl App {
                 return;
             }
         }
+
+        // Advance timeline past the end of this clip.
+        self.session.timeline_pos = self.clip_start_timeline + duration;
+        let _ = session::save(&self.session);
+
         self.record_start = None;
         self.mode = AppMode::PostRecording;
+    }
+
+    // ── Punch-and-roll lifecycle ──────────────────────────────────────────────
+
+    /// Called when P is pressed during Recording.  Stops the current recording,
+    /// computes the rollback point, and starts playing back the last N seconds.
+    fn begin_punch(&mut self) {
+        // Capture clip duration before dropping the WavWriter.
+        let duration = self
+            .wav
+            .as_ref()
+            .map(|w| Session::duration_from_bytes(w.data_bytes()))
+            .unwrap_or(0.0);
+        self.last_clip_duration = duration;
+
+        if let Some(handle) = self.capture.take() {
+            handle.stop();
+        }
+        if let Some(mut wav) = self.wav.take() {
+            if let Err(e) = wav.finalize() {
+                self.error_msg = format!("WAV finalise error during punch: {}", e);
+                self.mode = AppMode::Fatal;
+                return;
+            }
+        }
+        self.record_start = None;
+
+        // Compute rollback: rewind punch_back_time seconds from the end of the
+        // clip (clamped so we never seek before the clip's own start).
+        let rollback_offset = (duration - self.punch_back_time).max(0.0);
+        self.punch_rollback_abs = self.clip_start_timeline + rollback_offset;
+
+        let path = match &self.active_file {
+            Some(p) => p.clone(),
+            None => {
+                self.error_msg = "No active file for punch-and-roll.".into();
+                self.mode = AppMode::Fatal;
+                return;
+            }
+        };
+
+        match audio::start_playback(path, rollback_offset) {
+            Ok(handle) => {
+                self.playback = Some(handle);
+                self.playback_start = Some(Instant::now());
+                self.playback_done = false;
+                self.playback_elapsed = 0.0;
+                self.mode = AppMode::PunchRollback;
+            }
+            Err(e) => {
+                self.error_msg = format!("Cannot start playback: {}", e);
+                self.mode = AppMode::Fatal;
+            }
+        }
+    }
+
+    /// Called when Space is pressed during PunchRollback.  Stops playback,
+    /// computes the punch-in time, advances the session, and enters PunchReady.
+    fn punch_in(&mut self) {
+        if let Some(h) = self.playback.take() {
+            h.stop();
+        }
+
+        let elapsed = if self.playback_done {
+            self.playback_elapsed
+        } else {
+            self.playback_start
+                .map(|t| t.elapsed().as_secs_f64())
+                .unwrap_or(0.0)
+        };
+
+        // Cap punch-in so it can never be pushed past the end of the old clip.
+        let clip_end = self.clip_start_timeline + self.last_clip_duration;
+        let punch_in_time = (self.punch_rollback_abs + elapsed).min(clip_end);
+
+        self.session.timeline_pos = punch_in_time;
+        self.session.advance_part();
+        let _ = session::save(&self.session);
+
+        self.punch_ready_at = Some(Instant::now());
+        self.mode = AppMode::PunchReady;
+    }
+
+    /// Called when Esc is pressed during PunchRollback.
+    fn abort_punch_rollback(&mut self) {
+        if let Some(h) = self.playback.take() {
+            h.stop();
+        }
+        // The clip we just recorded is complete; advance timeline past it.
+        self.session.timeline_pos = self.clip_start_timeline + self.last_clip_duration;
+        let _ = session::save(&self.session);
+
+        self.mode = AppMode::PostRecording;
+        self.status_msg = Some("Punch-and-roll cancelled.".into());
     }
 
     // ── Periodic tick ─────────────────────────────────────────────────────────
@@ -445,6 +634,8 @@ impl App {
         match self.mode {
             AppMode::PreCheck => self.tick_precheck(),
             AppMode::Recording => self.tick_recording(),
+            AppMode::PunchRollback => self.tick_punch_rollback(),
+            AppMode::PunchReady => self.tick_punch_ready(),
             _ => {}
         }
     }
@@ -600,6 +791,51 @@ impl App {
         }
     }
 
+    fn tick_punch_rollback(&mut self) {
+        // Drain playback events.
+        let mut events = Vec::new();
+        if let Some(ref h) = self.playback {
+            loop {
+                match h.rx.try_recv() {
+                    Ok(e) => events.push(e),
+                    Err(_) => break,
+                }
+            }
+        }
+
+        for event in events {
+            match event {
+                audio::PlaybackEvent::Done => {
+                    if !self.playback_done {
+                        self.playback_done = true;
+                        // Freeze elapsed at the natural end of the clip segment.
+                        self.playback_elapsed = self
+                            .playback_start
+                            .map(|t| t.elapsed().as_secs_f64())
+                            .unwrap_or(0.0);
+                    }
+                }
+                audio::PlaybackEvent::Error(msg) => {
+                    self.playback = None;
+                    self.error_msg = format!("Playback error: {}", msg);
+                    self.mode = AppMode::Fatal;
+                    return;
+                }
+            }
+        }
+    }
+
+    fn tick_punch_ready(&mut self) {
+        // After 1 second of display, auto-transition to PreCheck for the new
+        // punch-in recording.
+        if let Some(t) = self.punch_ready_at {
+            if t.elapsed() >= Duration::from_secs(1) {
+                self.punch_ready_at = None;
+                self.begin_precheck();
+            }
+        }
+    }
+
     // ── Clean shutdown ────────────────────────────────────────────────────────
 
     /// Best-effort clean shutdown for SIGTERM / Ctrl-C.
@@ -608,6 +844,9 @@ impl App {
             let _ = wav.finalize();
         }
         if let Some(h) = self.capture.take() {
+            h.stop();
+        }
+        if let Some(h) = self.playback.take() {
             h.stop();
         }
         let _ = session::save(&self.session);
@@ -620,9 +859,18 @@ impl App {
         self.record_start.map(|t| t.elapsed())
     }
 
+    /// Current playback elapsed seconds (live or frozen at Done).
+    pub fn playback_elapsed_secs(&self) -> f64 {
+        if self.playback_done {
+            self.playback_elapsed
+        } else {
+            self.playback_start
+                .map(|t| t.elapsed().as_secs_f64())
+                .unwrap_or(0.0)
+        }
+    }
+
     /// Drain all pending audio events from the channel into a Vec.
-    /// Only borrows `self.capture` immutably, so callers can then use
-    /// `&mut self` freely while iterating the returned Vec.
     fn collect_audio_events(&self) -> Vec<AudioEvent> {
         let mut events = Vec::new();
         if let Some(ref h) = self.capture {
@@ -656,3 +904,4 @@ impl App {
         (events, disconnected)
     }
 }
+

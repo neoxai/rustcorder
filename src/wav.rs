@@ -66,6 +66,12 @@ impl WavWriter {
         Ok(())
     }
 
+    /// Total audio bytes written so far.  Used to compute clip duration before
+    /// calling `finalize()`.
+    pub fn data_bytes(&self) -> u32 {
+        self.data_bytes
+    }
+
     /// Flush and patch the RIFF/data size fields.  Must be called to produce a
     /// valid WAV file.
     pub fn finalize(&mut self) -> Result<()> {

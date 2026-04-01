@@ -21,6 +21,10 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use app::App;
 
 fn main() -> Result<()> {
+    // Load .env from the current working directory into the process environment.
+    // Silently ignored if the file is absent; shell env vars take precedence.
+    dotenvy::dotenv().ok();
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
