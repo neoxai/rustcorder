@@ -31,9 +31,36 @@ The binary is at `target/release/rustcorder`.
 
 # Unsafe mode — accepts any ALSA capture device (for testing)
 ./rustcorder --unsafe
+
+# Device configuration wizard — select microphone and playback device, run a
+# test recording, then save your choices to chosen.devices.txt
+./rustcorder --config
 ```
 
 Run from the directory where you want book folders created. Session state and the `.env` config file are read from the current working directory.
+
+---
+
+## Device Configuration (`--config`)
+
+Run `./rustcorder --config` once to set up your preferred microphone and playback device. The wizard:
+
+1. Lists every ALSA capture (microphone) device found on the machine.
+2. Lists every ALSA playback device, plus the system default.
+3. Records a 3-second test clip through the selected microphone.
+4. Plays it back through the selected output device.
+5. Saves the choices to `chosen.devices.txt` in the current directory.
+
+When `--unsafe` is started and `chosen.devices.txt` is present, those devices are used automatically — no auto-detection required.
+
+### `chosen.devices.txt` format
+
+```
+CAPTURE_DEVICE=hw:1,0
+CAPTURE_NAME=Deity VO-7U (VO7U)
+PLAYBACK_DEVICE=default
+PLAYBACK_NAME=System default (PipeWire / PulseAudio)
+```
 
 ---
 

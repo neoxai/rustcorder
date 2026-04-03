@@ -1,5 +1,6 @@
 mod app;
 mod audio;
+mod config;
 mod device;
 mod render;
 mod session;
@@ -24,6 +25,11 @@ fn main() -> Result<()> {
     // Load .env from the current working directory into the process environment.
     // Silently ignored if the file is absent; shell env vars take precedence.
     dotenvy::dotenv().ok();
+
+    // `--config` runs before the TUI — plain stdin/stdout, no raw mode.
+    if std::env::args().any(|a| a == "--config") {
+        return config::run_config();
+    }
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();

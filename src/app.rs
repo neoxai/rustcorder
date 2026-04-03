@@ -110,6 +110,11 @@ pub struct App {
     // ── Unsafe / testing mode ─────────────────────────────────────────────
     /// Set by `--unsafe`: allows any capture device, not just the Deity mic.
     pub unsafe_mode: bool,
+    /// Pre-selected capture device from `chosen.devices.txt` (unsafe mode only).
+    pub chosen_capture: Option<MicDevice>,
+    /// ALSA device name used for punch-and-roll playback.
+    /// Defaults to `"default"`; overridden by `chosen.devices.txt` in unsafe mode.
+    pub playback_device: String,
 
     // ── Quit flag ─────────────────────────────────────────────────────────
     pub should_quit: bool,
@@ -134,6 +139,28 @@ impl App {
             .and_then(|v| v.trim().parse::<f64>().ok())
             .unwrap_or(15.0)
             .max(1.0); // enforce minimum of 1 second
+
+        // In unsafe mode, load pre-selected devices from chosen.devices.txt.
+        let (chosen_capture, playback_device) = if unsafe_mode {
+            match device::load_chosen_devices() {
+                Some(chosen) => {
+                    let card_index = chosen.capture.alsa_name
+                        .strip_prefix("hw:")
+                        .and_then(|s| s.split(',').next())
+                        .and_then(|s| s.parse::<u32>().ok())
+                        .unwrap_or(0);
+                    let mic = MicDevice {
+                        card_index,
+                        alsa_name: chosen.capture.alsa_name,
+                        description: chosen.capture.description,
+                    };
+                    (Some(mic), chosen.playback.alsa_name)
+                }
+                None => (None, "default".to_string()),
+            }
+        } else {
+            (None, "default".to_string())
+        };
 
         App {
             session,
@@ -166,6 +193,8 @@ impl App {
             status_msg: None,
             error_msg: String::new(),
             unsafe_mode,
+            chosen_capture,
+            playback_device,
             should_quit: false,
         }
     }
@@ -175,6 +204,15 @@ impl App {
     /// Attempt to detect the approved USB microphone.  Call on startup and
     /// whenever re-entering Ready mode.
     pub fn detect_mic(&mut self) {
+        // If a device was pre-selected via `--config`, use it directly.
+        if let Some(ref chosen) = self.chosen_capture.clone() {
+            self.mic = Some(chosen.clone());
+            if self.mode == AppMode::MicError {
+                self.mode = AppMode::Ready;
+            }
+            return;
+        }
+
         let result = if self.unsafe_mode {
             device::find_any_capture_device()
         } else {
@@ -559,7 +597,7 @@ impl App {
             }
         };
 
-        match audio::start_playback(path, rollback_offset) {
+        match audio::start_playback(path, rollback_offset, &self.playback_device) {
             Ok(handle) => {
                 self.playback = Some(handle);
                 self.playback_start = Some(Instant::now());

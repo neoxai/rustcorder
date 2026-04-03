@@ -111,17 +111,19 @@ pub fn start_capture(alsa_name: &str, unsafe_mode: bool) -> Result<CaptureHandle
 }
 
 /// Spawn a playback thread that reads from a WAV file (our fixed format) and
-/// outputs to the ALSA `default` device.
+/// outputs to the named ALSA device.
 ///
 /// `offset_secs` — how many seconds into the file to start reading from.
 /// Aligned automatically to the nearest 3-byte (one sample) boundary.
-pub fn start_playback(path: PathBuf, offset_secs: f64) -> Result<PlaybackHandle> {
+/// `device` — ALSA PCM name, e.g. `"default"` or `"hw:0,0"`.
+pub fn start_playback(path: PathBuf, offset_secs: f64, device: &str) -> Result<PlaybackHandle> {
+    let device = device.to_string();
     let (tx, rx) = mpsc::sync_channel::<PlaybackEvent>(8);
     let stop = Arc::new(AtomicBool::new(false));
     let stop_clone = Arc::clone(&stop);
 
     let thread = thread::spawn(move || {
-        if let Err(e) = playback_loop(&path, offset_secs, &tx, &stop_clone) {
+        if let Err(e) = playback_loop(&path, offset_secs, &device, &tx, &stop_clone) {
             let _ = tx.send(PlaybackEvent::Error(e.to_string()));
         }
     });
@@ -148,9 +150,11 @@ fn capture_loop(
     // In unsafe mode we also fall back from S24LE to S16LE so generic
     // sound cards (which rarely support S24LE) are accepted for testing.
     let actual_channels: u32;
-    // true = S24LE (24 bits, normalise by 2^23)
-    // false = S16LE (16 bits, samples will be left-shifted ×256 before writing)
-    let use_s24: bool;
+    // Shift applied to each ALSA i32 sample before writing S24LE to disk:
+    //   S24LE → 0   (native, no shift)
+    //   S16LE → +8  (left-shift to fill 24-bit range)
+    //   S32LE → -8  (right-shift to reduce to 24-bit range)
+    let sample_shift: i32;
     {
         let hwp = HwParams::any(&pcm)?;
         actual_channels = if hwp.set_channels(1).is_ok() { 1 } else { 2 };
@@ -159,14 +163,18 @@ fn capture_loop(
         }
         hwp.set_rate(SAMPLE_RATE, alsa::ValueOr::Nearest)?;
 
-        if unsafe_mode && hwp.set_format(Format::S24LE).is_err() {
-            hwp.set_format(Format::S16LE)?;
-            use_s24 = false;
+        if !unsafe_mode {
+            hwp.set_format(Format::S24LE)?;
+            sample_shift = 0;
+        } else if hwp.set_format(Format::S24LE).is_ok() {
+            sample_shift = 0;
+        } else if hwp.set_format(Format::S16LE).is_ok() {
+            sample_shift = 8;
         } else {
-            if !unsafe_mode {
-                hwp.set_format(Format::S24LE)?;
-            }
-            use_s24 = true;
+            // Last resort: some devices (e.g. internal laptop audio) only
+            // expose S32LE at the hw: layer.
+            hwp.set_format(Format::S32LE)?;
+            sample_shift = -8;
         }
 
         hwp.set_access(Access::RWInterleaved)?;
@@ -195,12 +203,11 @@ fn capture_loop(
                 } else {
                     buf[..frames].to_vec()
                 };
-                // S16LE → S24LE range: shift left 8 bits so the WAV writer
-                // and RMS calculator see consistent 24-bit scale.
-                if !use_s24 {
-                    for s in &mut samples {
-                        *s <<= 8;
-                    }
+                // Normalise to S24LE range for the WAV writer and RMS calculator.
+                match sample_shift {
+                    s if s > 0 => { for x in &mut samples { *x <<= s; } } // S16LE
+                    s if s < 0 => { for x in &mut samples { *x >>= -s; } } // S32LE
+                    _ => {} // S24LE — already in range
                 }
                 let rms_db = compute_rms_db(&samples);
                 if tx.send(AudioEvent::Samples { data: samples, rms_db }).is_err() {
@@ -244,6 +251,7 @@ fn capture_loop(
 fn playback_loop(
     path: &std::path::Path,
     offset_secs: f64,
+    device: &str,
     tx: &mpsc::SyncSender<PlaybackEvent>,
     stop: &Arc<AtomicBool>,
 ) -> Result<()> {
@@ -257,10 +265,8 @@ fn playback_loop(
     let aligned_offset = raw_offset - (raw_offset % BYTES_PER_SAMPLE as u64);
     file.seek(std::io::SeekFrom::Start(WAV_HEADER_BYTES + aligned_offset))?;
 
-    // Open the default ALSA playback device.  On Ubuntu with PipeWire/
-    // PulseAudio the `default` PCM is a software-mixed virtual device that
-    // routes to whatever the OS considers the active output.
-    let pcm = PCM::new("default", Direction::Playback, false)?;
+    // Open the requested ALSA playback device.
+    let pcm = PCM::new(device, Direction::Playback, false)?;
 
     // Negotiate format.  Prefer S32LE (software devices almost always support
     // it); fall back is not needed since `default` is very flexible.  We use
