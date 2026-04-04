@@ -2,6 +2,7 @@ mod app;
 mod audio;
 mod config;
 mod device;
+mod playback;
 mod render;
 mod session;
 mod wav;
@@ -29,6 +30,22 @@ fn main() -> Result<()> {
     // `--config` runs before the TUI — plain stdin/stdout, no raw mode.
     if std::env::args().any(|a| a == "--config") {
         return config::run_config();
+    }
+
+    // `--playback` runs before the TUI — terminal only, no alternate screen.
+    if std::env::args().any(|a| a == "--playback") {
+        let args: Vec<String> = std::env::args().collect();
+        let player_type = args
+            .windows(2)
+            .find(|w| w[0] == "--type")
+            .and_then(|w| w[1].parse::<u8>().ok())
+            .unwrap_or(1);
+        let file = args
+            .windows(2)
+            .find(|w| w[0] == "--file")
+            .map(|w| std::path::PathBuf::from(&w[1]))
+            .ok_or_else(|| anyhow::anyhow!("--file <path> is required with --playback"))?;
+        return playback::run(player_type, &file);
     }
 
     enable_raw_mode()?;

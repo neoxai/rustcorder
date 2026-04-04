@@ -16,3 +16,10 @@ crossterm   = "0.28"
 signal-hook = "0.3"
 anyhow      = "1"
 dotenvy     = "0.15"
+
+# Playback experiment crates (src/playback/)
+# Build requirements: libpulse-dev must be installed (sudo apt install libpulse-dev)
+rodio                   = "0.19"
+cpal                    = "0.15"
+libpulse-binding        = "2"
+libpulse-simple-binding = "2"
