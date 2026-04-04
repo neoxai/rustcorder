@@ -1,0 +1,2 @@
+PLAYBACK_DEVICE=default
+PLAYBACK_NAME=System default

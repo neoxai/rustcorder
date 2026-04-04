@@ -45,8 +45,6 @@ fn main() -> Result<()> {
 }
 
 fn run() -> Result<()> {
-    let unsafe_mode = std::env::args().any(|a| a == "--unsafe");
-
     // Register a SIGTERM handler so the app can shut down cleanly when asked
     // to exit by the OS / process manager.
     let sigterm = Arc::new(AtomicBool::new(false));
@@ -55,7 +53,7 @@ fn run() -> Result<()> {
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(unsafe_mode);
+    let mut app = App::new();
 
     // Attempt initial mic detection (non-fatal; UI will show the error).
     app.detect_mic();

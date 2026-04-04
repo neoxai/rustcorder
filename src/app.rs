@@ -28,8 +28,6 @@ pub enum AppMode {
     /// Playing back the last N seconds of the just-recorded clip so the user
     /// can find the punch-in point.
     PunchRollback,
-    /// Punch-in time confirmed; briefly displayed before transitioning to PreCheck.
-    PunchReady,
     /// Approved mic is missing or was unplugged.
     MicError,
     /// Unrecoverable error (ALSA failure, disk full, etc.).
@@ -100,28 +98,25 @@ pub struct App {
     pub playback_done: bool,
     /// Elapsed seconds at the moment PlaybackEvent::Done was received.
     pub playback_elapsed: f64,
-    /// When PunchReady mode was entered (for auto-transition to PreCheck).
-    pub punch_ready_at: Option<Instant>,
-
     // ── Status / error messages ───────────────────────────────────────────
     pub status_msg: Option<String>,
     pub error_msg: String,
 
-    // ── Unsafe / testing mode ─────────────────────────────────────────────
-    /// Set by `--unsafe`: allows any capture device, not just the Deity mic.
-    pub unsafe_mode: bool,
-    /// Pre-selected capture device from `chosen.devices.txt` (unsafe mode only).
-    pub chosen_capture: Option<MicDevice>,
     /// ALSA device name used for punch-and-roll playback.
-    /// Defaults to `"default"`; overridden by `chosen.devices.txt` in unsafe mode.
+    /// Defaults to `"default"`; overridden by `chosen.devices.txt` after `--config`.
     pub playback_device: String,
+
+    // ── One-time pre-check ────────────────────────────────────────────────
+    /// True after the first pre-check has completed.  Subsequent recordings
+    /// skip the signal check and start capturing immediately.
+    pub precheck_done: bool,
 
     // ── Quit flag ─────────────────────────────────────────────────────────
     pub should_quit: bool,
 }
 
 impl App {
-    pub fn new(unsafe_mode: bool) -> Self {
+    pub fn new() -> Self {
         let session = session::load().unwrap_or_else(|| Session::new(String::new(), 1));
         let mode = if session.book.is_empty() {
             AppMode::Setup
@@ -140,27 +135,10 @@ impl App {
             .unwrap_or(15.0)
             .max(1.0); // enforce minimum of 1 second
 
-        // In unsafe mode, load pre-selected devices from chosen.devices.txt.
-        let (chosen_capture, playback_device) = if unsafe_mode {
-            match device::load_chosen_devices() {
-                Some(chosen) => {
-                    let card_index = chosen.capture.alsa_name
-                        .strip_prefix("hw:")
-                        .and_then(|s| s.split(',').next())
-                        .and_then(|s| s.parse::<u32>().ok())
-                        .unwrap_or(0);
-                    let mic = MicDevice {
-                        card_index,
-                        alsa_name: chosen.capture.alsa_name,
-                        description: chosen.capture.description,
-                    };
-                    (Some(mic), chosen.playback.alsa_name)
-                }
-                None => (None, "default".to_string()),
-            }
-        } else {
-            (None, "default".to_string())
-        };
+        // Load playback device from chosen.devices.txt if present.
+        let playback_device = device::load_chosen_devices()
+            .map(|c| c.playback.alsa_name)
+            .unwrap_or_else(|| "default".to_string());
 
         App {
             session,
@@ -189,12 +167,10 @@ impl App {
             playback_start: None,
             playback_done: false,
             playback_elapsed: 0.0,
-            punch_ready_at: None,
             status_msg: None,
             error_msg: String::new(),
-            unsafe_mode,
-            chosen_capture,
             playback_device,
+            precheck_done: false,
             should_quit: false,
         }
     }
@@ -204,21 +180,7 @@ impl App {
     /// Attempt to detect the approved USB microphone.  Call on startup and
     /// whenever re-entering Ready mode.
     pub fn detect_mic(&mut self) {
-        // If a device was pre-selected via `--config`, use it directly.
-        if let Some(ref chosen) = self.chosen_capture.clone() {
-            self.mic = Some(chosen.clone());
-            if self.mode == AppMode::MicError {
-                self.mode = AppMode::Ready;
-            }
-            return;
-        }
-
-        let result = if self.unsafe_mode {
-            device::find_any_capture_device()
-        } else {
-            device::find_approved_mic()
-        };
-        match result {
+        match device::find_approved_mic() {
             Ok(mic) => {
                 self.mic = Some(mic);
                 if self.mode == AppMode::MicError {
@@ -252,7 +214,6 @@ impl App {
             AppMode::Recording => self.handle_key_recording(key),
             AppMode::PostRecording => self.handle_key_post(key),
             AppMode::PunchRollback => self.handle_key_punch_rollback(key),
-            AppMode::PunchReady => self.handle_key_punch_ready(key),
             AppMode::MicError => self.handle_key_mic_error(key),
             AppMode::Fatal => {
                 if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
@@ -409,15 +370,6 @@ impl App {
         }
     }
 
-    fn handle_key_punch_ready(&mut self, key: KeyEvent) {
-        // Allow aborting the punch before the auto-transition fires.
-        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
-            self.punch_ready_at = None;
-            self.mode = AppMode::PostRecording;
-            self.status_msg = Some("Punch-and-roll cancelled.".into());
-        }
-    }
-
     fn handle_key_mic_error(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('r') | KeyCode::Char('R') | KeyCode::Enter => {
@@ -448,9 +400,15 @@ impl App {
             }
         }
 
+        // Skip the signal check after the first successful pre-check.
+        if self.precheck_done {
+            self.start_recording();
+            return;
+        }
+
         let alsa_name = self.mic.as_ref().unwrap().alsa_name.clone();
 
-        match audio::start_capture(&alsa_name, self.unsafe_mode) {
+        match audio::start_capture(&alsa_name) {
             Ok(handle) => {
                 self.capture = Some(handle);
                 self.precheck_frames_seen = 0;
@@ -476,7 +434,7 @@ impl App {
         // Re-open ALSA for recording (a fresh capture session).
         let alsa_name = self.mic.as_ref().unwrap().alsa_name.clone();
 
-        match audio::start_capture(&alsa_name, self.unsafe_mode) {
+        match audio::start_capture(&alsa_name) {
             Ok(handle) => {
                 // Prepare the output file.
                 if let Err(e) = self.session.ensure_output_dir() {
@@ -613,10 +571,11 @@ impl App {
     }
 
     /// Called when Space is pressed during PunchRollback.  Stops playback,
-    /// computes the punch-in time, advances the session, and enters PunchReady.
+    /// sets the timeline to the current playback position (overlapping the
+    /// previous clip), and starts recording immediately.
     fn punch_in(&mut self) {
         if let Some(h) = self.playback.take() {
-            h.stop();
+            h.signal_stop(); // Non-blocking: don't freeze the main thread on writei
         }
 
         let elapsed = if self.playback_done {
@@ -627,7 +586,8 @@ impl App {
                 .unwrap_or(0.0)
         };
 
-        // Cap punch-in so it can never be pushed past the end of the old clip.
+        // Set timeline to exactly where playback was when Space was pressed.
+        // Capped at the old clip's end so we never create a gap.
         let clip_end = self.clip_start_timeline + self.last_clip_duration;
         let punch_in_time = (self.punch_rollback_abs + elapsed).min(clip_end);
 
@@ -635,8 +595,7 @@ impl App {
         self.session.advance_part();
         let _ = session::save(&self.session);
 
-        self.punch_ready_at = Some(Instant::now());
-        self.mode = AppMode::PunchReady;
+        self.start_recording();
     }
 
     /// Called when Esc is pressed during PunchRollback.
@@ -673,7 +632,6 @@ impl App {
             AppMode::PreCheck => self.tick_precheck(),
             AppMode::Recording => self.tick_recording(),
             AppMode::PunchRollback => self.tick_punch_rollback(),
-            AppMode::PunchReady => self.tick_punch_ready(),
             _ => {}
         }
     }
@@ -731,6 +689,7 @@ impl App {
         }
 
         if self.precheck_signal_found {
+            self.precheck_done = true;
             self.start_recording();
         } else {
             self.status_msg = Some(
@@ -859,17 +818,6 @@ impl App {
                     self.mode = AppMode::Fatal;
                     return;
                 }
-            }
-        }
-    }
-
-    fn tick_punch_ready(&mut self) {
-        // After 1 second of display, auto-transition to PreCheck for the new
-        // punch-in recording.
-        if let Some(t) = self.punch_ready_at {
-            if t.elapsed() >= Duration::from_secs(1) {
-                self.punch_ready_at = None;
-                self.begin_precheck();
             }
         }
     }

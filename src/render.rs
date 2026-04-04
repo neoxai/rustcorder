@@ -43,36 +43,18 @@ pub fn draw(f: &mut Frame, app: &App) {
     // Inner usable area (inside the border)
     let inner = inner_rect(area);
 
-    let constraints = if app.unsafe_mode {
-        vec![
-            Constraint::Length(3), // header bar
-            Constraint::Length(3), // unsafe warning banner
-            Constraint::Min(0),    // body
-            Constraint::Length(1), // keybind footer
-        ]
-    } else {
-        vec![
-            Constraint::Length(3), // header bar
-            Constraint::Min(0),    // body
-            Constraint::Length(1), // keybind footer
-        ]
-    };
-
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(constraints)
+        .constraints([
+            Constraint::Length(3), // header bar
+            Constraint::Min(0),    // body
+            Constraint::Length(1), // keybind footer
+        ])
         .split(inner);
 
-    if app.unsafe_mode {
-        draw_header(f, app, chunks[0]);
-        draw_unsafe_banner(f, app, chunks[1]);
-        draw_body(f, app, chunks[2]);
-        draw_footer(f, app, chunks[3]);
-    } else {
-        draw_header(f, app, chunks[0]);
-        draw_body(f, app, chunks[1]);
-        draw_footer(f, app, chunks[2]);
-    }
+    draw_header(f, app, chunks[0]);
+    draw_body(f, app, chunks[1]);
+    draw_footer(f, app, chunks[2]);
 }
 
 // ── Header ────────────────────────────────────────────────────────────────────
@@ -85,7 +67,6 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         AppMode::Recording => Span::styled("[ *** RECORDING *** ]", bold(RED)),
         AppMode::PostRecording => Span::styled("[ STOPPED ]", bold(YELLOW)),
         AppMode::PunchRollback => Span::styled("[ ROLLING BACK ]", bold(YELLOW)),
-        AppMode::PunchReady => Span::styled("[ PUNCHING IN ]", bold(GREEN)),
         AppMode::MicError => Span::styled("[ MIC ERROR ]", bold(RED)),
         AppMode::Fatal => Span::styled("[ FATAL ERROR ]", bold(RED)),
     };
@@ -125,36 +106,6 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(paragraph, area);
 }
 
-// ── Unsafe warning banner ─────────────────────────────────────────────────────
-
-fn draw_unsafe_banner(f: &mut Frame, app: &App, area: Rect) {
-    let mic_name = app
-        .mic
-        .as_ref()
-        .map(|m| m.description.clone())
-        .unwrap_or_else(|| "NONE".to_string());
-
-    let warning_style = Style::default()
-        .fg(Color::Black)
-        .bg(YELLOW)
-        .add_modifier(Modifier::BOLD);
-
-    let lines = vec![
-        Line::from(Span::styled(
-            "  !! FOR TESTING ONLY — UNAPPROVED DEVICE MODE !!  ",
-            warning_style,
-        )),
-        Line::from(vec![
-            Span::styled("  Microphone: ", warning_style),
-            Span::styled(mic_name, warning_style.add_modifier(Modifier::UNDERLINED)),
-        ]),
-    ];
-
-    f.render_widget(
-        Paragraph::new(lines).alignment(Alignment::Center),
-        area,
-    );
-}
 
 // ── Body ──────────────────────────────────────────────────────────────────────
 
@@ -166,7 +117,6 @@ fn draw_body(f: &mut Frame, app: &App, area: Rect) {
         AppMode::Recording => draw_recording(f, app, area),
         AppMode::PostRecording => draw_post_recording(f, app, area),
         AppMode::PunchRollback => draw_punch_rollback(f, app, area),
-        AppMode::PunchReady => draw_punch_ready(f, app, area),
         AppMode::MicError => draw_mic_error(f, app, area),
         AppMode::Fatal => draw_fatal(f, app, area),
     }
@@ -563,31 +513,6 @@ fn draw_punch_rollback(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-// ── Punch ready ───────────────────────────────────────────────────────────────
-
-fn draw_punch_ready(f: &mut Frame, app: &App, area: Rect) {
-    let lines = vec![
-        Line::from(Span::styled(
-            "  ●  PUNCHING IN  ●  ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(GREEN)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::raw("")),
-        Line::from(vec![
-            Span::styled("  Timeline position: ", dim()),
-            Span::styled(
-                format!("{:.3} s", app.session.timeline_pos),
-                bold(CYAN),
-            ),
-        ]),
-        Line::from(Span::raw("")),
-        Line::from(Span::styled("Starting signal check…", dim())),
-    ];
-    f.render_widget(Paragraph::new(lines), area);
-}
-
 // ── Mic error ─────────────────────────────────────────────────────────────────
 
 fn draw_mic_error(f: &mut Frame, app: &App, area: Rect) {
@@ -651,7 +576,6 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         AppMode::Recording => "[Space] Stop   [P] Punch and roll",
         AppMode::PostRecording => "[Y/Enter] Continue chapter   [N] Chapter complete",
         AppMode::PunchRollback => "[Space] Punch in here   [Esc] Cancel",
-        AppMode::PunchReady => "[Esc] Cancel",
         AppMode::MicError => "[R] Retry detection   [Q] Quit",
         AppMode::Fatal => "[Q] Quit",
     };

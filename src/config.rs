@@ -1,9 +1,8 @@
 //! Interactive device configuration wizard (`--config`).
 //!
-//! Runs before the TUI is initialised — uses plain stdin/stdout.  Enumerates
-//! all ALSA capture and playback devices, lets the user pick one of each,
-//! records a 3-second test clip through the chosen microphone, plays it back
-//! through the chosen output device, then writes `chosen.devices.txt`.
+//! Runs before the TUI is initialised — uses plain stdin/stdout.  Detects the
+//! Deity VO-7U, lets the user pick a playback device, records a 3-second test
+//! clip, plays it back, then writes `chosen.devices.txt`.
 
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -26,22 +25,25 @@ pub fn run_config() -> Result<()> {
     println!("=== rustcorder — Device Configuration ===");
     println!();
 
+    // Capture is always the Deity VO-7U.
+    let mic = device::find_approved_mic()?;
+    println!("Microphone: {}", mic.description);
+    println!();
+
     loop {
-        let capture = pick_capture_device()?;
         let playback = pick_playback_device()?;
 
         println!();
         println!("Selected:");
-        print_device_summary("  Capture ", &capture);
+        println!("  Capture : {}", mic.description);
         print_device_summary("  Playback", &playback);
 
-        let ok = run_test(&capture.alsa_name, &playback.alsa_name)?;
+        let ok = run_test(&mic.alsa_name, &playback.alsa_name)?;
 
         if ok {
-            device::save_chosen_devices(&ChosenDevices { capture, playback })?;
+            device::save_chosen_devices(&ChosenDevices { playback })?;
             println!();
             println!("Saved to chosen.devices.txt.");
-            println!("Run  rustcorder --unsafe  to record with these devices.");
             println!();
             break;
         }
@@ -54,40 +56,11 @@ pub fn run_config() -> Result<()> {
     Ok(())
 }
 
-// ── Device pickers ────────────────────────────────────────────────────────────
-
-fn pick_capture_device() -> Result<DeviceInfo> {
-    let devices = device::enumerate_capture_devices();
-
-    if devices.is_empty() {
-        anyhow::bail!(
-            "No capture-capable ALSA devices found.\n\
-             Check that your microphone is connected and recognised by the kernel."
-        );
-    }
-
-    println!("Capture devices (microphones):");
-    println!();
-    print_device_list(&devices);
-
-    loop {
-        print!("Select capture device [1-{}]: ", devices.len());
-        io::stdout().flush()?;
-        let mut line = String::new();
-        io::stdin().read_line(&mut line)?;
-        if let Ok(n) = line.trim().parse::<usize>() {
-            if n >= 1 && n <= devices.len() {
-                return Ok(devices.into_iter().nth(n - 1).unwrap());
-            }
-        }
-        println!("Please enter a number between 1 and {}.", devices.len());
-    }
-}
+// ── Device picker ─────────────────────────────────────────────────────────────
 
 fn pick_playback_device() -> Result<DeviceInfo> {
     let devices = device::enumerate_playback_devices();
 
-    println!();
     println!("Playback devices (speakers / headphones):");
     println!();
     print_device_list(&devices);
@@ -110,7 +83,6 @@ fn pick_playback_device() -> Result<DeviceInfo> {
 
 fn print_device_list(devices: &[DeviceInfo]) {
     for (i, d) in devices.iter().enumerate() {
-        // First line: index, name, bus tag, ALSA address
         if d.bus_type.is_empty() {
             println!("  [{}]  {}   {}", i + 1, d.description, d.alsa_name);
         } else {
@@ -122,7 +94,6 @@ fn print_device_list(devices: &[DeviceInfo]) {
                 d.alsa_name
             );
         }
-        // Optional detail line (manufacturer, serial, hardware address, etc.)
         if let Some(ref det) = d.detail {
             println!("       {}", det);
         }
@@ -157,8 +128,7 @@ fn run_test(capture_alsa: &str, playback_alsa: &str) -> Result<bool> {
     );
     io::stdout().flush()?;
 
-    // unsafe_mode=true so any device format is accepted during the test
-    let cap = audio::start_capture(capture_alsa, true)?;
+    let cap = audio::start_capture(capture_alsa)?;
     let mut wav = WavWriter::new(&path)?;
 
     let start = Instant::now();

@@ -90,19 +90,27 @@ impl PlaybackHandle {
             let _ = h.join();
         }
     }
+
+    /// Signal the thread to stop without blocking.  Used for punch-in so the
+    /// main thread stays responsive.  The playback thread will see the flag
+    /// within one `writei` period (~21 ms) and call `pcm.drop()` itself.
+    pub fn signal_stop(self) {
+        self.stop.store(true, Ordering::SeqCst);
+        // Dropping self here abandons the JoinHandle; the thread exits on its own.
+    }
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Spawn an ALSA capture thread for `alsa_name` (e.g. `"hw:1,0"`).
-pub fn start_capture(alsa_name: &str, unsafe_mode: bool) -> Result<CaptureHandle> {
+pub fn start_capture(alsa_name: &str) -> Result<CaptureHandle> {
     let (tx, rx) = mpsc::sync_channel::<AudioEvent>(CHANNEL_CAP);
     let stop = Arc::new(AtomicBool::new(false));
     let stop_clone = Arc::clone(&stop);
     let device = alsa_name.to_string();
 
     let thread = thread::spawn(move || {
-        if let Err(e) = capture_loop(&device, &tx, &stop_clone, unsafe_mode) {
+        if let Err(e) = capture_loop(&device, &tx, &stop_clone) {
             let _ = tx.send(AudioEvent::Error(e.to_string()));
         }
     });
@@ -137,24 +145,23 @@ fn capture_loop(
     device: &str,
     tx: &mpsc::SyncSender<AudioEvent>,
     stop: &Arc<AtomicBool>,
-    unsafe_mode: bool,
 ) -> Result<()> {
-    let pcm = PCM::new(device, Direction::Capture, false)?;
+    // The Deity VO-7U exposes only S24_3LE (packed 3-byte 24-bit) at the hw:
+    // layer.  io_i32() requires S32LE, so we open via plughw: which converts
+    // S24_3LE → S32LE in software (lossless bit-shift, no resampling).
+    // We then shift the S32LE samples right by 8 to recover the S24 range
+    // expected by the WAV writer and RMS calculator.
+    let plughw_device: String = device
+        .strip_prefix("hw:")
+        .map(|rest| format!("plughw:{}", rest))
+        .unwrap_or_else(|| device.to_string());
 
-    // Some USB microphones (including broadcast mics) only expose a stereo
-    // interface at the hw: layer even though the capsule is mono.  Try mono
-    // first (PLAN baseline); fall back to stereo if the hardware rejects it.
-    // When stereo is used we extract only the left channel so the WAV file is
-    // always mono, matching the PLAN audio-capture baseline.
-    //
-    // In unsafe mode we also fall back from S24LE to S16LE so generic
-    // sound cards (which rarely support S24LE) are accepted for testing.
+    let pcm = PCM::new(&plughw_device, Direction::Capture, false)?;
+
+    // The Deity presents a stereo interface at the hw: layer even though the
+    // capsule is mono.  Try mono first; fall back to stereo and extract the
+    // left channel so the WAV file is always mono.
     let actual_channels: u32;
-    // Shift applied to each ALSA i32 sample before writing S24LE to disk:
-    //   S24LE → 0   (native, no shift)
-    //   S16LE → +8  (left-shift to fill 24-bit range)
-    //   S32LE → -8  (right-shift to reduce to 24-bit range)
-    let sample_shift: i32;
     {
         let hwp = HwParams::any(&pcm)?;
         actual_channels = if hwp.set_channels(1).is_ok() { 1 } else { 2 };
@@ -162,21 +169,7 @@ fn capture_loop(
             hwp.set_channels(2)?;
         }
         hwp.set_rate(SAMPLE_RATE, alsa::ValueOr::Nearest)?;
-
-        if !unsafe_mode {
-            hwp.set_format(Format::S24LE)?;
-            sample_shift = 0;
-        } else if hwp.set_format(Format::S24LE).is_ok() {
-            sample_shift = 0;
-        } else if hwp.set_format(Format::S16LE).is_ok() {
-            sample_shift = 8;
-        } else {
-            // Last resort: some devices (e.g. internal laptop audio) only
-            // expose S32LE at the hw: layer.
-            hwp.set_format(Format::S32LE)?;
-            sample_shift = -8;
-        }
-
+        hwp.set_format(Format::S32LE)?;
         hwp.set_access(Access::RWInterleaved)?;
         pcm.hw_params(&hwp)?;
     }
@@ -198,17 +191,13 @@ fn capture_loop(
             Ok(frames) => {
                 // If we opened stereo, extract only the left channel so
                 // everything downstream always deals with mono samples.
-                let mut samples: Vec<i32> = if actual_channels == 2 {
-                    buf[..frames * 2].iter().step_by(2).copied().collect()
+                // S32LE → S24 range: shift right 8 so the WAV writer and
+                // RMS calculator see consistent 24-bit scale.
+                let samples: Vec<i32> = if actual_channels == 2 {
+                    buf[..frames * 2].iter().step_by(2).map(|&s| s >> 8).collect()
                 } else {
-                    buf[..frames].to_vec()
+                    buf[..frames].iter().map(|&s| s >> 8).collect()
                 };
-                // Normalise to S24LE range for the WAV writer and RMS calculator.
-                match sample_shift {
-                    s if s > 0 => { for x in &mut samples { *x <<= s; } } // S16LE
-                    s if s < 0 => { for x in &mut samples { *x >>= -s; } } // S32LE
-                    _ => {} // S24LE — already in range
-                }
                 let rms_db = compute_rms_db(&samples);
                 if tx.send(AudioEvent::Samples { data: samples, rms_db }).is_err() {
                     break; // receiver dropped
@@ -323,14 +312,18 @@ fn playback_loop(
             alsa_buf[i] = s24 << 8; // scale to S32LE range
         }
 
-        // Write to ALSA, looping on partial writes and xrun recovery.
+        // Write to ALSA in small chunks so the stop flag is checked frequently.
+        // 128 frames ≈ 2.7 ms at 48 kHz — tight enough that pcm.drop() fires
+        // within ~3 ms of signal_stop() being called.
+        const WRITE_CHUNK: usize = 128;
         let mut written = 0;
         while written < samples {
             if stop.load(Ordering::Relaxed) {
                 stopped_early = true;
                 break 'outer;
             }
-            match io.writei(&alsa_buf[written..samples]) {
+            let chunk_end = (written + WRITE_CHUNK).min(samples);
+            match io.writei(&alsa_buf[written..chunk_end]) {
                 Ok(n) => written += n,
                 Err(e) => match pcm.try_recover(e, false) {
                     Ok(_) => {}

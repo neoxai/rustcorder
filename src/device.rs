@@ -38,13 +38,12 @@ pub struct DeviceInfo {
     pub detail: Option<String>,
 }
 
-/// A pair of pre-selected capture and playback devices written by `--config`.
+/// The playback device written by `--config`.
 pub struct ChosenDevices {
-    pub capture: DeviceInfo,
     pub playback: DeviceInfo,
 }
 
-// ── Approved-mic detection (normal mode) ─────────────────────────────────────
+// ── Approved-mic detection ────────────────────────────────────────────────────
 
 /// Scan all ALSA sound cards for exactly one approved USB microphone.
 ///
@@ -104,58 +103,7 @@ pub fn is_mic_present(mic: &MicDevice) -> bool {
     Path::new(&format!("/sys/class/sound/card{}", mic.card_index)).exists()
 }
 
-/// Scan all ALSA sound cards and return a capture-capable device.
-///
-/// Used only when `--unsafe` is passed.  Prefers the approved Deity mic if
-/// it is present; falls back to the first other capture-capable card found.
-pub fn find_any_capture_device() -> Result<MicDevice> {
-    if let Ok(approved) = find_approved_mic() {
-        return Ok(approved);
-    }
-
-    let dir = match std::fs::read_dir("/sys/class/sound") {
-        Ok(d) => d,
-        Err(e) => bail!("Cannot enumerate ALSA devices (/sys/class/sound): {}", e),
-    };
-
-    let mut cards: Vec<u32> = dir
-        .flatten()
-        .filter_map(|e| {
-            let n = e.file_name();
-            let s = n.to_string_lossy();
-            s.strip_prefix("card")
-                .and_then(|rest| rest.parse::<u32>().ok())
-        })
-        .collect();
-
-    cards.sort_unstable();
-
-    for card_num in cards {
-        if has_capture_pcm(card_num) {
-            let card_id = read_card_id(card_num)
-                .unwrap_or_else(|| format!("card{}", card_num));
-            return Ok(MicDevice {
-                card_index: card_num,
-                alsa_name: format!("hw:{},0", card_num),
-                description: format!("{} (card{})", card_id, card_num),
-            });
-        }
-    }
-
-    bail!("No capture-capable ALSA device found.")
-}
-
 // ── Device enumeration (--config wizard) ─────────────────────────────────────
-
-/// Return all ALSA cards that expose at least one capture PCM node, sorted by
-/// card index and annotated with bus type and extra metadata.
-pub fn enumerate_capture_devices() -> Vec<DeviceInfo> {
-    sorted_card_indices()
-        .into_iter()
-        .filter(|&n| has_capture_pcm(n))
-        .map(|n| build_device_info(n))
-        .collect()
-}
 
 /// Return all ALSA cards that expose at least one playback PCM node, prefixed
 /// by the ALSA `"default"` virtual device (covers PipeWire / PulseAudio,
@@ -182,21 +130,15 @@ pub fn enumerate_playback_devices() -> Vec<DeviceInfo> {
 
 // ── chosen.devices.txt persistence ───────────────────────────────────────────
 
-/// Load the devices previously selected by the `--config` wizard.
+/// Load the playback device previously selected by the `--config` wizard.
 /// Returns `None` if the file is absent or malformed.
 pub fn load_chosen_devices() -> Option<ChosenDevices> {
     let content = fs::read_to_string(CHOSEN_DEVICES_FILE).ok()?;
-    let mut capture_device = None;
-    let mut capture_name: Option<String> = None;
     let mut playback_device = None;
     let mut playback_name: Option<String> = None;
 
     for line in content.lines() {
-        if let Some(v) = line.strip_prefix("CAPTURE_DEVICE=") {
-            capture_device = Some(v.trim().to_string());
-        } else if let Some(v) = line.strip_prefix("CAPTURE_NAME=") {
-            capture_name = Some(v.trim().to_string());
-        } else if let Some(v) = line.strip_prefix("PLAYBACK_DEVICE=") {
+        if let Some(v) = line.strip_prefix("PLAYBACK_DEVICE=") {
             playback_device = Some(v.trim().to_string());
         } else if let Some(v) = line.strip_prefix("PLAYBACK_NAME=") {
             playback_name = Some(v.trim().to_string());
@@ -204,12 +146,6 @@ pub fn load_chosen_devices() -> Option<ChosenDevices> {
     }
 
     Some(ChosenDevices {
-        capture: DeviceInfo {
-            alsa_name: capture_device?,
-            description: capture_name.unwrap_or_default(),
-            bus_type: String::new(),
-            detail: None,
-        },
         playback: DeviceInfo {
             alsa_name: playback_device?,
             description: playback_name.unwrap_or_default(),
@@ -219,11 +155,9 @@ pub fn load_chosen_devices() -> Option<ChosenDevices> {
     })
 }
 
-/// Write the selected devices to `chosen.devices.txt`.
+/// Write the selected playback device to `chosen.devices.txt`.
 pub fn save_chosen_devices(chosen: &ChosenDevices) -> Result<()> {
     let mut f = fs::File::create(CHOSEN_DEVICES_FILE)?;
-    writeln!(f, "CAPTURE_DEVICE={}", chosen.capture.alsa_name)?;
-    writeln!(f, "CAPTURE_NAME={}", chosen.capture.description)?;
     writeln!(f, "PLAYBACK_DEVICE={}", chosen.playback.alsa_name)?;
     writeln!(f, "PLAYBACK_NAME={}", chosen.playback.description)?;
     Ok(())
