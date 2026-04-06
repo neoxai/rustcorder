@@ -73,6 +73,44 @@ impl Session {
         data_bytes as f64 / BYTE_RATE
     }
 
+    /// Remove the last CLIP entry from this chapter's timeline index file.
+    ///
+    /// Used when a clip is discarded after recording (e.g. DISCARD_SHORT_CLIPS).
+    /// The entry is already in the file because it was written at recording start
+    /// for crash-safety; this retracts it at stop time.
+    pub fn remove_last_timeline_entry(&self) -> Result<()> {
+        let path = self
+            .output_dir()
+            .join(format!("Chapter_{:02}_timeline.txt", self.chapter));
+
+        if !path.exists() {
+            return Ok(());
+        }
+
+        let content = fs::read_to_string(&path)?;
+        let lines: Vec<&str> = content.lines().collect();
+
+        // Find the last line that starts with "CLIP ".
+        if let Some(idx) = lines.iter().rposition(|l| l.starts_with("CLIP ")) {
+            let new_content = lines
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != idx)
+                .map(|(_, l)| *l)
+                .collect::<Vec<_>>()
+                .join("\n");
+            // Preserve trailing newline.
+            let new_content = if content.ends_with('\n') {
+                format!("{}\n", new_content)
+            } else {
+                new_content
+            };
+            fs::write(&path, new_content)?;
+        }
+
+        Ok(())
+    }
+
     /// Append a CLIP entry to this chapter's timeline index file.
     ///
     /// The file is created with a header comment on first write.  Entries are

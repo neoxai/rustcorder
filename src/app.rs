@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -109,6 +110,13 @@ pub struct App {
     /// skip the signal check and start capturing immediately.
     pub precheck_done: bool,
 
+    // ── Short-clip discard ────────────────────────────────────────────────
+    /// Loaded from DISCARD_SHORT_CLIPS env var; defaults to false.
+    pub discard_short_clips: bool,
+    /// Minimum clip duration (seconds) to keep. Loaded from DISCARD_DURATION
+    /// env var (value in seconds, e.g. "1s"); defaults to 1.0.
+    pub discard_duration_secs: f64,
+
     // ── Quit flag ─────────────────────────────────────────────────────────
     pub should_quit: bool,
 }
@@ -142,6 +150,16 @@ impl App {
             .unwrap_or(10.0)
             .max(0.0);
 
+        // Read DISCARD_SHORT_CLIPS / DISCARD_DURATION from environment.
+        let discard_short_clips = std::env::var("DISCARD_SHORT_CLIPS")
+            .map(|v| v.trim().eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let discard_duration_secs = std::env::var("DISCARD_DURATION")
+            .ok()
+            .and_then(|v| v.trim().trim_end_matches('s').parse::<f64>().ok())
+            .unwrap_or(1.0)
+            .max(0.0);
+
         App {
             session,
             mode,
@@ -173,6 +191,8 @@ impl App {
             status_msg: None,
             error_msg: String::new(),
             precheck_done: false,
+            discard_short_clips,
+            discard_duration_secs,
             should_quit: false,
         }
     }
@@ -510,6 +530,25 @@ impl App {
             }
         }
 
+        // Discard clips that are too short — delete the file and retract the
+        // timeline entry that was written at recording start.
+        if self.discard_short_clips && duration < self.discard_duration_secs {
+            if let Some(ref path) = self.active_file {
+                let _ = fs::remove_file(path);
+            }
+            let _ = self.session.remove_last_timeline_entry();
+            // Timeline does not advance — the clip never happened.
+            let _ = session::save(&self.session);
+            self.active_file = None;
+            self.record_start = None;
+            self.status_msg = Some(format!(
+                "Clip discarded (shorter than {:.1}s threshold).",
+                self.discard_duration_secs
+            ));
+            self.mode = AppMode::PostRecording;
+            return;
+        }
+
         // Advance timeline past the end of this clip.
         self.session.timeline_pos = self.clip_start_timeline + duration;
         let _ = session::save(&self.session);
@@ -542,6 +581,24 @@ impl App {
             }
         }
         self.record_start = None;
+
+        // Discard clips that are too short — can't punch-roll on them meaningfully.
+        // Retract the clip, restore timeline, and return to PostRecording.
+        if self.discard_short_clips && self.last_clip_duration < self.discard_duration_secs {
+            if let Some(ref path) = self.active_file {
+                let _ = fs::remove_file(path);
+            }
+            let _ = self.session.remove_last_timeline_entry();
+            self.session.timeline_pos = self.clip_start_timeline;
+            let _ = session::save(&self.session);
+            self.active_file = None;
+            self.status_msg = Some(format!(
+                "Clip discarded (shorter than {:.1}s threshold).",
+                self.discard_duration_secs
+            ));
+            self.mode = AppMode::PostRecording;
+            return;
+        }
 
         // Compute rollback: rewind punch_back_time seconds from the end of the
         // clip (clamped so we never seek before the clip's own start).

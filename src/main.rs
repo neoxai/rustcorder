@@ -2,6 +2,7 @@ mod app;
 mod audio;
 mod config;
 mod device;
+mod export;
 mod playback;
 mod render;
 mod session;
@@ -30,6 +31,29 @@ fn main() -> Result<()> {
     // `--config` runs before the TUI — plain stdin/stdout, no raw mode.
     if std::env::args().any(|a| a == "--config") {
         return config::run_config();
+    }
+
+    // `--export` reconstructs a chapter from its timeline and clip files.
+    if std::env::args().any(|a| a == "--export") {
+        let args: Vec<String> = std::env::args().collect();
+        let book = args
+            .windows(2)
+            .find(|w| w[0] == "--book")
+            .map(|w| w[1].clone())
+            .ok_or_else(|| anyhow::anyhow!("--book <name> is required with --export"))?;
+        let chapter: u32 = args
+            .windows(2)
+            .find(|w| w[0] == "--chapter")
+            .and_then(|w| w[1].parse().ok())
+            .ok_or_else(|| anyhow::anyhow!("--chapter <n> is required with --export"))?;
+        let crossfade_ms = std::env::var("CROSSFADE_TIME")
+            .ok()
+            .and_then(|v| v.trim().trim_end_matches("ms").parse::<f64>().ok())
+            .unwrap_or(10.0);
+        let book_dir = std::path::Path::new(&book);
+        let out = export::timeline::export_chapter(book_dir, chapter, crossfade_ms)?;
+        println!("Exported: {}", out.display());
+        return Ok(());
     }
 
     // `--playback` runs before the TUI — terminal only, no alternate screen.
