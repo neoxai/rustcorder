@@ -3,10 +3,9 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::audio::{
-    self, AudioEvent, CaptureHandle, PlaybackHandle, PRECHECK_SECONDS, SAMPLE_RATE,
-    SILENCE_THRESHOLD_DB, SILENCE_WARNING_SECONDS,
-};
+use crate::audio::{self, AudioEvent, CaptureHandle, PRECHECK_SECONDS, SAMPLE_RATE,
+    SILENCE_THRESHOLD_DB, SILENCE_WARNING_SECONDS};
+use crate::playback::{self as pb, PlaybackEvent, PlaybackHandle};
 use crate::device::{self, MicDevice};
 use crate::session::{self, Session};
 use crate::wav::WavWriter;
@@ -82,8 +81,11 @@ pub struct App {
 
     // ── Phase 2: punch-and-roll ───────────────────────────────────────────
     /// How far back (seconds) to rewind before rollback playback.
-    /// Loaded from PUNCH_BACK_TIME env var; defaults to 15.0.
+    /// Loaded from PUNCH_BACK_TIME env var (value in seconds, e.g. "15s"); defaults to 15.0.
     pub punch_back_time: f64,
+    /// Crossfade duration in milliseconds applied at punch-in/out boundaries.
+    /// Loaded from CROSSFADE_TIME env var (value in ms, e.g. "10ms"); defaults to 10.0.
+    pub crossfade_time: f64,
     /// Absolute timeline position (seconds) when the current/last clip started.
     pub clip_start_timeline: f64,
     /// Duration (seconds) of the clip that triggered a punch operation.
@@ -101,10 +103,6 @@ pub struct App {
     // ── Status / error messages ───────────────────────────────────────────
     pub status_msg: Option<String>,
     pub error_msg: String,
-
-    /// ALSA device name used for punch-and-roll playback.
-    /// Defaults to `"default"`; overridden by `chosen.devices.txt` after `--config`.
-    pub playback_device: String,
 
     // ── One-time pre-check ────────────────────────────────────────────────
     /// True after the first pre-check has completed.  Subsequent recordings
@@ -129,16 +127,20 @@ impl App {
         let setup_chapter = format!("{:02}", session.chapter);
 
         // Read PUNCH_BACK_TIME from environment (already loaded from .env by main).
+        // Value is in seconds with an optional "s" suffix (e.g. "15s" or "15").
         let punch_back_time = std::env::var("PUNCH_BACK_TIME")
             .ok()
-            .and_then(|v| v.trim().parse::<f64>().ok())
+            .and_then(|v| v.trim().trim_end_matches('s').parse::<f64>().ok())
             .unwrap_or(15.0)
             .max(1.0); // enforce minimum of 1 second
 
-        // Load playback device from chosen.devices.txt if present.
-        let playback_device = device::load_chosen_devices()
-            .map(|c| c.playback.alsa_name)
-            .unwrap_or_else(|| "default".to_string());
+        // Read CROSSFADE_TIME from environment.
+        // Value is in milliseconds with an optional "ms" suffix (e.g. "10ms" or "10").
+        let crossfade_time = std::env::var("CROSSFADE_TIME")
+            .ok()
+            .and_then(|v| v.trim().trim_end_matches("ms").parse::<f64>().ok())
+            .unwrap_or(10.0)
+            .max(0.0);
 
         App {
             session,
@@ -160,6 +162,7 @@ impl App {
             precheck_target_frames: (PRECHECK_SECONDS * SAMPLE_RATE as f64) as usize,
             record_start: None,
             punch_back_time,
+            crossfade_time,
             clip_start_timeline: 0.0,
             last_clip_duration: 0.0,
             punch_rollback_abs: 0.0,
@@ -169,7 +172,6 @@ impl App {
             playback_elapsed: 0.0,
             status_msg: None,
             error_msg: String::new(),
-            playback_device,
             precheck_done: false,
             should_quit: false,
         }
@@ -555,7 +557,7 @@ impl App {
             }
         };
 
-        match audio::start_playback(path, rollback_offset, &self.playback_device) {
+        match pb::start_playback(path, rollback_offset) {
             Ok(handle) => {
                 self.playback = Some(handle);
                 self.playback_start = Some(Instant::now());
@@ -802,7 +804,7 @@ impl App {
 
         for event in events {
             match event {
-                audio::PlaybackEvent::Done => {
+                PlaybackEvent::Done => {
                     if !self.playback_done {
                         self.playback_done = true;
                         // Freeze elapsed at the natural end of the clip segment.
@@ -812,7 +814,7 @@ impl App {
                             .unwrap_or(0.0);
                     }
                 }
-                audio::PlaybackEvent::Error(msg) => {
+                PlaybackEvent::Error(msg) => {
                     self.playback = None;
                     self.error_msg = format!("Playback error: {}", msg);
                     self.mode = AppMode::Fatal;

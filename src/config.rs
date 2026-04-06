@@ -9,6 +9,8 @@ use std::path::PathBuf;
 use std::sync::mpsc::TryRecvError;
 use std::time::Instant;
 
+use crate::playback::{self as pb, PlaybackEvent};
+
 use anyhow::Result;
 
 use crate::audio::{self, AudioEvent};
@@ -175,11 +177,11 @@ fn run_test(capture_alsa: &str, playback_alsa: &str) -> Result<bool> {
     // ── Play back ─────────────────────────────────────────────────────────
     println!("Playing back through: {}", playback_alsa);
 
-    let pb = audio::start_playback(path.clone(), 0.0, playback_alsa)?;
+    let pb = pb::start_playback(path.clone(), 0.0)?;
     loop {
         match pb.rx.recv() {
-            Ok(audio::PlaybackEvent::Done) => break,
-            Ok(audio::PlaybackEvent::Error(e)) => {
+            Ok(PlaybackEvent::Done) => break,
+            Ok(PlaybackEvent::Error(e)) => {
                 pb.stop();
                 let _ = std::fs::remove_file(&path);
                 anyhow::bail!("Playback error: {}", e);

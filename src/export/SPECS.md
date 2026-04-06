@@ -1,0 +1,5 @@
+- When generating the final combined output of the recording, we will use the timeline.txt to rebuild it.
+- Create a copy of the trimmed relevant audio clips so that there is only ever 1 file for any section of time in the timeline. The last recorded one should always win if there are multiple files spanning a certain time region. If a file was recorded over completely or contributed zero seconds to the final timeline, it should be omitted.
+- Once all the relevant audio files are clipped and ordered in a temp folder, we need to apply a slight overlap and cross-fade between them to avoid popping when transitioning. The overlap amount should be CROSSFADE_TIME=10ms as specified in the .env. 
+- When cross fading, the ending clip should be ramping down in volume over the crossfade duration as the starting clip is ramping up. 
+- The final exported file should be a single .wav file for the entire chapter, flattened so that the fade-outs and fade-ins occur simultaneously, not leaving any point of absolute silence. 
