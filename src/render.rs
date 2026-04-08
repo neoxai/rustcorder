@@ -110,21 +110,21 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 // ── Body ──────────────────────────────────────────────────────────────────────
 
 fn draw_body(f: &mut Frame, app: &App, area: Rect) {
-    // When an EPUB is loaded, split the body vertically: recording pane on top,
-    // EPUB pane on the bottom.  EPUB_PANE_RATIO controls the bottom share (%).
+    // When an EPUB is loaded, split the body horizontally: recording pane on left,
+    // EPUB pane on the right.  EPUB_PANE_RATIO controls the right share (%).
     if app.epub.is_some() {
         let ratio = std::env::var("EPUB_PANE_RATIO")
             .ok()
             .and_then(|v| v.trim().parse::<u16>().ok())
             .unwrap_or(60)
             .clamp(10, 90);
-        let bottom_pct = ratio;
-        let top_pct = 100 - bottom_pct;
+        let right_pct = ratio;
+        let left_pct = 100 - right_pct;
         let chunks = Layout::default()
-            .direction(Direction::Vertical)
+            .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Percentage(top_pct),
-                Constraint::Percentage(bottom_pct),
+                Constraint::Percentage(left_pct),
+                Constraint::Percentage(right_pct),
             ])
             .split(area);
         draw_body_mode(f, app, chunks[0]);
