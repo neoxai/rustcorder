@@ -148,6 +148,7 @@
 <div id="footer" id="footer"></div>
 <div id="overlay">Connecting to rustcorder…</div>
 
+<script src="/jszip.min.js"></script>
 <script src="/epub.min.js"></script>
 <script>
 'use strict';
@@ -194,6 +195,13 @@ function connect() {
 
   ws.onerror = () => ws.close();
 }
+
+// Fetch state immediately on load so the EPUB starts loading before the
+// WebSocket handshake completes.
+fetch('/state')
+  .then(r => r.json())
+  .then(state => { handleStateEpub(state); })
+  .catch(() => {});
 
 connect();
 
@@ -263,7 +271,16 @@ function loadEpub() {
   noEpub.classList.remove('visible');
   viewer.style.display = 'block';
 
-  const book = ePub('/epub');
+  fetch('/epub')
+    .then(r => r.arrayBuffer())
+    .then(buf => loadEpubFromBuffer(buf))
+    .catch(err => console.warn('epub fetch error:', err));
+}
+
+function loadEpubFromBuffer(buf) {
+  const viewer = document.getElementById('viewer');
+
+  const book = ePub(buf);
   rendition = book.renderTo('viewer', {
     flow:   'scrolled-doc',
     width:  '100%',
