@@ -112,7 +112,10 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 fn draw_body(f: &mut Frame, app: &App, area: Rect) {
     // When an EPUB is loaded, split the body horizontally: recording pane on left,
     // EPUB pane on the right.  EPUB_PANE_RATIO controls the right share (%).
-    if app.epub.is_some() {
+    // EPUB_PANE=browser suppresses the terminal pane entirely (browser is the reader).
+    let epub_pane_env = std::env::var("EPUB_PANE").unwrap_or_default();
+    let show_terminal_epub = !epub_pane_env.eq_ignore_ascii_case("browser");
+    if app.epub.is_some() && show_terminal_epub {
         let ratio = std::env::var("EPUB_PANE_RATIO")
             .ok()
             .and_then(|v| v.trim().parse::<u16>().ok())

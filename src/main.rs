@@ -80,6 +80,16 @@ fn main() -> Result<()> {
     // for pushing state snapshots, and a receiver for browser actions.
     let (web_port, state_tx, action_rx) = web::spawn()?;
 
+    // Auto-open browser if BROWSER_OPEN=true.
+    if std::env::var("BROWSER_OPEN")
+        .map(|v| v.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        let _ = std::process::Command::new("xdg-open")
+            .arg(format!("http://localhost:{web_port}/"))
+            .spawn();
+    }
+
     let web_mode = std::env::var("WEB_MODE")
         .map(|v| v.trim().eq_ignore_ascii_case("true"))
         .unwrap_or(false);

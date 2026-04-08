@@ -94,6 +94,7 @@ async fn serve(
     let app = Router::new()
         .route("/", get(index))
         .route("/epub", get(epub_handler))
+        .route("/epub.min.js", get(epubjs_handler))
         .route("/state", get(state_handler))
         .route("/ws", get(ws_handler))
         .with_state(server_state);
@@ -110,6 +111,14 @@ async fn serve(
 
 async fn index() -> axum::response::Html<&'static str> {
     axum::response::Html(include_str!("../../static/index.html"))
+}
+
+async fn epubjs_handler() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        &include_bytes!("../../static/epub.min.js")[..],
+    )
+        .into_response()
 }
 
 async fn epub_handler(
