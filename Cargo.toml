@@ -17,7 +17,7 @@ signal-hook = "0.3"
 anyhow      = "1"
 dotenvy     = "0.15"
 
-axum        = "0.7"
+axum        = { version = "0.7", features = ["ws"] }
 tokio       = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"

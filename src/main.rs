@@ -24,6 +24,7 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, Terminal};
 
 use app::App;
+use web::state::{BrowserState, StateTx};
 
 fn main() -> Result<()> {
     // Load .env from the current working directory into the process environment.
@@ -74,24 +75,23 @@ fn main() -> Result<()> {
         return playback::run(player_type, &file);
     }
 
-    // Start the local web server before entering the TUI.  It has no
-    // dependency on the terminal and should run for the full process lifetime.
-    // Returns the bound port, or an error if no port in the search range is free.
-    let web_port = web::spawn()?;
+    // Start the local web server.  Returns the bound port and a channel sender
+    // for pushing state snapshots to connected clients.
+    let (web_port, state_tx) = web::spawn()?;
 
     let web_mode = std::env::var("WEB_MODE")
         .map(|v| v.trim().eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
     if web_mode {
-        return run_headless(web_port);
+        return run_headless(web_port, state_tx);
     }
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
 
-    let result = run();
+    let result = run(state_tx);
 
     // Always restore terminal, even on error.
     let _ = disable_raw_mode();
@@ -100,7 +100,7 @@ fn main() -> Result<()> {
     result
 }
 
-fn run_headless(port: u16) -> Result<()> {
+fn run_headless(port: u16, state_tx: StateTx) -> Result<()> {
     eprintln!("rustcorder [WEB_MODE]: open http://localhost:{port}/ in your browser");
     eprintln!("rustcorder [WEB_MODE]: press Ctrl-C to quit");
 
@@ -118,6 +118,7 @@ fn run_headless(port: u16) -> Result<()> {
             break;
         }
         app.tick();
+        let _ = state_tx.send(BrowserState::from_app(&app));
         if app.should_quit {
             break;
         }
@@ -127,7 +128,7 @@ fn run_headless(port: u16) -> Result<()> {
     Ok(())
 }
 
-fn run() -> Result<()> {
+fn run(state_tx: StateTx) -> Result<()> {
     // Register a SIGTERM handler so the app can shut down cleanly when asked
     // to exit by the OS / process manager.
     let sigterm = Arc::new(AtomicBool::new(false));
@@ -148,6 +149,9 @@ fn run() -> Result<()> {
         let epub_pane_width = terminal.size().map(|s| s.width).unwrap_or(80);
         app.epub_set_pane_width(epub_pane_width);
         terminal.draw(|f| render::draw(f, &app))?;
+
+        // ── Broadcast state to browser clients ────────────────────────────
+        let _ = state_tx.send(BrowserState::from_app(&app));
 
         // ── Process OS signals ────────────────────────────────────────────
         if sigterm.load(Ordering::Relaxed) {
