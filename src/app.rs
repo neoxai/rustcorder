@@ -600,10 +600,10 @@ impl App {
             return;
         }
 
-        // Compute rollback: rewind punch_back_time seconds from the end of the
-        // clip (clamped so we never seek before the clip's own start).
-        let rollback_offset = (duration - self.punch_back_time).max(0.0);
-        self.punch_rollback_abs = self.clip_start_timeline + rollback_offset;
+        // Compute rollback: start punch_back_time seconds before the end of this
+        // clip on the absolute timeline (may reach into prior clips).
+        let clip_end = self.clip_start_timeline + duration;
+        self.punch_rollback_abs = (clip_end - self.punch_back_time).max(0.0);
 
         let path = match &self.active_file {
             Some(p) => p.clone(),
@@ -614,7 +614,54 @@ impl App {
             }
         };
 
-        match pb::start_playback(path, rollback_offset) {
+        // Build the playback segment list.  When the rollback point is inside
+        // the current file we need only one segment; when it reaches into prior
+        // clips we resolve those via the timeline (same "last recorded wins"
+        // logic as export) and prepend them before the current clip.
+        let segments = if self.punch_rollback_abs >= self.clip_start_timeline {
+            // Rollback stays within the current file.
+            vec![pb::PlaybackSegment {
+                path: path.clone(),
+                offset_secs: self.punch_rollback_abs - self.clip_start_timeline,
+                limit_secs: f64::INFINITY,
+            }]
+        } else {
+            // Rollback crosses into prior clips.
+            let timeline_path = self.session.output_dir()
+                .join(format!("Chapter_{:02}_timeline.txt", self.session.chapter));
+            match crate::export::timeline::punch_rollback_segments(
+                &timeline_path,
+                &self.session.output_dir(),
+                self.punch_rollback_abs,
+                self.clip_start_timeline,
+                &path,
+                self.discard_short_clips,
+                self.discard_duration_secs,
+            ) {
+                Ok(segs) => segs
+                    .into_iter()
+                    .map(|s| pb::PlaybackSegment {
+                        path: s.path,
+                        offset_secs: s.file_offset_secs,
+                        limit_secs: s.play_secs,
+                    })
+                    .collect(),
+                Err(e) => {
+                    // Fall back to playing the current clip from its start.
+                    self.status_msg = Some(format!(
+                        "Warning: multi-file rollback unavailable ({}), playing from clip start.",
+                        e
+                    ));
+                    vec![pb::PlaybackSegment {
+                        path: path.clone(),
+                        offset_secs: 0.0,
+                        limit_secs: f64::INFINITY,
+                    }]
+                }
+            }
+        };
+
+        match pb::start_playback_segments(segments) {
             Ok(handle) => {
                 self.playback = Some(handle);
                 self.playback_start = Some(Instant::now());

@@ -471,7 +471,7 @@ fn draw_punch_rollback(f: &mut Frame, app: &App, area: Rect) {
 
     // Playback counter
     let elapsed = app.playback_elapsed_secs();
-    let total = app.punch_back_time.min(app.last_clip_duration);
+    let total = app.punch_back_time.min(app.clip_start_timeline + app.last_clip_duration);
     let done_tag = if app.playback_done {
         Span::styled("  (end of clip)", dim())
     } else {

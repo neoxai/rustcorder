@@ -171,17 +171,26 @@ impl PlaybackHandle {
     }
 }
 
-/// Spawn a playback thread for the main app (punch-and-roll).
+/// A contiguous region within one WAV file to stream during punch-and-roll.
+pub struct PlaybackSegment {
+    pub path: PathBuf,
+    /// Seconds into the file where playback starts; aligned to a sample boundary.
+    pub offset_secs: f64,
+    /// How many seconds to play; `f64::INFINITY` means play to EOF.
+    pub limit_secs: f64,
+}
+
+/// Spawn a playback thread for one or more sequential WAV segments (punch-and-roll).
 ///
-/// `path`         — WAV file to play (our fixed 48 kHz / 24-bit / mono format).
-/// `offset_secs`  — seconds into the file to start from; aligned to sample boundary.
-pub fn start_playback(path: PathBuf, offset_secs: f64) -> Result<PlaybackHandle> {
+/// Segments are played in order with no gap.  `PlaybackEvent::Done` is sent
+/// after the last segment finishes.
+pub fn start_playback_segments(segments: Vec<PlaybackSegment>) -> Result<PlaybackHandle> {
     let (tx, rx) = mpsc::sync_channel::<PlaybackEvent>(8);
     let stop = Arc::new(AtomicBool::new(false));
     let stop_clone = Arc::clone(&stop);
 
     let thread = thread::spawn(move || {
-        if let Err(e) = app_playback_loop(&path, offset_secs, &tx, &stop_clone) {
+        if let Err(e) = app_playback_loop(&segments, &tx, &stop_clone) {
             let _ = tx.send(PlaybackEvent::Error(e.to_string()));
         }
     });
@@ -189,23 +198,24 @@ pub fn start_playback(path: PathBuf, offset_secs: f64) -> Result<PlaybackHandle>
     Ok(PlaybackHandle { stop, thread: Some(thread), rx })
 }
 
+/// Convenience wrapper: play a single WAV file from `offset_secs` to EOF.
+pub fn start_playback(path: PathBuf, offset_secs: f64) -> Result<PlaybackHandle> {
+    start_playback_segments(vec![PlaybackSegment {
+        path,
+        offset_secs,
+        limit_secs: f64::INFINITY,
+    }])
+}
+
 // ── PulseAudio streaming loop ─────────────────────────────────────────────────
 
 fn app_playback_loop(
-    path: &Path,
-    offset_secs: f64,
+    segments: &[PlaybackSegment],
     tx: &mpsc::SyncSender<PlaybackEvent>,
     stop: &Arc<AtomicBool>,
 ) -> Result<()> {
     const BYTE_RATE: f64 = 144_000.0; // 48 kHz × 3 bytes/sample
     const CHUNK_SAMPLES: usize = 1024; // ≈21 ms at 48 kHz — same as ALSA period
-
-    // Seek to the right position in the file, aligned to a 3-byte boundary.
-    let raw_offset = (offset_secs * BYTE_RATE) as u64;
-    let aligned_offset = raw_offset - (raw_offset % BYTES_PER_SAMPLE as u64);
-
-    let mut file = File::open(path)?;
-    file.seek(std::io::SeekFrom::Start(WAV_HEADER_BYTES as u64 + aligned_offset))?;
 
     let spec = Spec { format: Format::S32le, rate: 48_000, channels: 1 };
     let pa = Simple::new(
@@ -222,40 +232,73 @@ fn app_playback_loop(
     let mut wav_buf = vec![0u8; CHUNK_SAMPLES * BYTES_PER_SAMPLE];
     let mut s32_buf = vec![0u8; CHUNK_SAMPLES * 4];
 
-    loop {
+    for segment in segments {
         if stop.load(Ordering::Relaxed) {
             let _ = pa.flush();
-            break;
+            return Ok(());
         }
 
-        // Read the next chunk of 24-bit WAV bytes from disk.
-        let mut total_read = 0;
-        while total_read < wav_buf.len() {
-            match file.read(&mut wav_buf[total_read..]) {
-                Ok(0) => break,
-                Ok(n) => total_read += n,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e.into()),
+        // Seek to the start of this segment, aligned to a 3-byte sample boundary.
+        let raw_offset = (segment.offset_secs * BYTE_RATE) as u64;
+        let aligned_offset = raw_offset - (raw_offset % BYTES_PER_SAMPLE as u64);
+
+        // Maximum bytes to read from this segment; u64::MAX = no limit.
+        let limit_bytes: u64 = if segment.limit_secs.is_finite() {
+            let raw = (segment.limit_secs * BYTE_RATE) as u64;
+            raw - (raw % BYTES_PER_SAMPLE as u64)
+        } else {
+            u64::MAX
+        };
+
+        let mut file = File::open(&segment.path)?;
+        file.seek(std::io::SeekFrom::Start(WAV_HEADER_BYTES as u64 + aligned_offset))?;
+
+        let mut bytes_played: u64 = 0;
+
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                let _ = pa.flush();
+                return Ok(());
             }
-        }
 
-        if total_read == 0 {
-            let _ = pa.drain();
-            let _ = tx.send(PlaybackEvent::Done);
-            break;
-        }
+            let remaining = limit_bytes.saturating_sub(bytes_played);
+            if remaining == 0 {
+                break; // segment limit reached; move to next segment
+            }
 
-        // Convert 24-bit LE samples to S32LE (left-shift 8) for PulseAudio.
-        let samples = total_read / BYTES_PER_SAMPLE;
-        for i in 0..samples {
-            s32_buf[i * 4]     = 0x00;
-            s32_buf[i * 4 + 1] = wav_buf[i * 3];
-            s32_buf[i * 4 + 2] = wav_buf[i * 3 + 1];
-            s32_buf[i * 4 + 3] = wav_buf[i * 3 + 2];
-        }
+            // How many bytes to request this chunk, aligned to sample size.
+            let chunk_bytes = wav_buf.len().min(remaining as usize);
+            let chunk_bytes = chunk_bytes - (chunk_bytes % BYTES_PER_SAMPLE);
 
-        pa.write(&s32_buf[..samples * 4])?;
+            let mut total_read = 0;
+            while total_read < chunk_bytes {
+                match file.read(&mut wav_buf[total_read..chunk_bytes]) {
+                    Ok(0) => break,
+                    Ok(n) => total_read += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+
+            if total_read == 0 {
+                break; // EOF on this segment; move to next
+            }
+
+            // Convert 24-bit LE samples to S32LE (left-shift 8) for PulseAudio.
+            let samples = total_read / BYTES_PER_SAMPLE;
+            for i in 0..samples {
+                s32_buf[i * 4]     = 0x00;
+                s32_buf[i * 4 + 1] = wav_buf[i * 3];
+                s32_buf[i * 4 + 2] = wav_buf[i * 3 + 1];
+                s32_buf[i * 4 + 3] = wav_buf[i * 3 + 2];
+            }
+
+            pa.write(&s32_buf[..samples * 4])?;
+            bytes_played += total_read as u64;
+        }
     }
 
+    let _ = pa.drain();
+    let _ = tx.send(PlaybackEvent::Done);
     Ok(())
 }

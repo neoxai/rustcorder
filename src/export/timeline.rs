@@ -264,6 +264,93 @@ fn crossfade_concat(clips: &[Vec<i32>], cf_samples: usize) -> Vec<i32> {
     result
 }
 
+// ── Punch-and-roll playback segments ─────────────────────────────────────────
+
+/// A contiguous region within one WAV file to stream during punch-and-roll rollback.
+pub struct PunchSegment {
+    pub path: PathBuf,
+    /// Seconds into the file where playback starts.
+    pub file_offset_secs: f64,
+    /// How many seconds to play; `f64::INFINITY` means play to EOF.
+    pub play_secs: f64,
+}
+
+/// Build the ordered list of WAV segments to stream during punch-and-roll rollback.
+///
+/// Covers the timeline range `[rollback_start, current_start + current_duration]`
+/// using "last recorded wins" semantics for prior clips (matching export), then
+/// appends the current clip from `max(rollback_start, current_start)` to EOF.
+///
+/// `rollback_start`  — absolute timeline position to begin playback from.
+/// `current_start`   — timeline position where the just-recorded clip began.
+/// `current_file`    — path to the just-recorded clip.
+/// `discard_short` / `discard_secs` — mirror the DISCARD_SHORT_CLIPS settings.
+pub fn punch_rollback_segments(
+    timeline_path: &Path,
+    book_dir: &Path,
+    rollback_start: f64,
+    current_start: f64,
+    current_file: &Path,
+    discard_short: bool,
+    discard_secs: f64,
+) -> Result<Vec<PunchSegment>> {
+    let mut segments = Vec::new();
+
+    // Build segments from prior clips only when the rollback reaches behind the
+    // current clip's start.
+    if rollback_start < current_start {
+        let entries = parse_timeline(timeline_path)?;
+        let n = entries.len();
+
+        // entries[n-1] is the current clip (appended at recording start).
+        // Iterate prior entries; use all entries for effective_end computation
+        // so that later-recorded clips correctly supersede earlier ones.
+        for i in 0..n.saturating_sub(1) {
+            let entry = &entries[i];
+            let path = book_dir.join(&entry.filename);
+
+            let total_samples = match wav_sample_count(&path) {
+                Ok(s) => s,
+                Err(_) => continue, // skip unreadable files
+            };
+            let total_secs = total_samples as f64 / SAMPLE_RATE as f64;
+
+            if discard_short && total_secs < discard_secs {
+                continue;
+            }
+
+            // Effective end is capped by the next entry's start (last recorded wins).
+            let next_start = entries[i + 1].start;
+            let effective_end = (entry.start + total_secs).min(next_start);
+            if effective_end <= entry.start {
+                continue; // completely superseded
+            }
+
+            // Overlap with the prior-clip range [rollback_start, current_start].
+            let overlap_start = rollback_start.max(entry.start);
+            let overlap_end = current_start.min(effective_end);
+            if overlap_start >= overlap_end {
+                continue;
+            }
+
+            segments.push(PunchSegment {
+                path,
+                file_offset_secs: overlap_start - entry.start,
+                play_secs: overlap_end - overlap_start,
+            });
+        }
+    }
+
+    // Always append the current clip from max(rollback_start, current_start) to EOF.
+    segments.push(PunchSegment {
+        path: current_file.to_path_buf(),
+        file_offset_secs: (rollback_start - current_start).max(0.0),
+        play_secs: f64::INFINITY,
+    });
+
+    Ok(segments)
+}
+
 // ── Public entry point ────────────────────────────────────────────────────────
 
 /// Export a single chapter to a combined WAV file.
