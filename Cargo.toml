@@ -17,6 +17,8 @@ signal-hook = "0.3"
 anyhow      = "1"
 dotenvy     = "0.15"
 
+epub = "2"
+
 # Playback experiment crates (src/playback/)
 # Build requirements: libpulse-dev must be installed (sudo apt install libpulse-dev)
 rodio                   = "0.19"

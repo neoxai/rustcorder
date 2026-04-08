@@ -2,6 +2,7 @@ mod app;
 mod audio;
 mod config;
 mod device;
+mod epub;
 mod export;
 mod playback;
 mod render;
@@ -101,6 +102,10 @@ fn run() -> Result<()> {
 
     loop {
         // ── Render ────────────────────────────────────────────────────────
+        // Inform the app of the current terminal width so the EPUB pane can
+        // re-wrap if the terminal was resized since the last frame.
+        let epub_pane_width = terminal.size().map(|s| s.width).unwrap_or(80);
+        app.epub_set_pane_width(epub_pane_width);
         terminal.draw(|f| render::draw(f, &app))?;
 
         // ── Process OS signals ────────────────────────────────────────────

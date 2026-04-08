@@ -6,6 +6,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::audio::{self, AudioEvent, CaptureHandle, PRECHECK_SECONDS, SAMPLE_RATE,
     SILENCE_THRESHOLD_DB, SILENCE_WARNING_SECONDS};
+use crate::epub::EpubReader;
 use crate::playback::{self as pb, PlaybackEvent, PlaybackHandle};
 use crate::device::{self, MicDevice};
 use crate::session::{self, Session};
@@ -117,6 +118,20 @@ pub struct App {
     /// env var (value in seconds, e.g. "1s"); defaults to 1.0.
     pub discard_duration_secs: f64,
 
+    // ── EPUB reader ───────────────────────────────────────────────────────
+    /// Loaded EPUB, if one was found in the book directory.
+    pub epub: Option<EpubReader>,
+    /// Lines to scroll per `←`/`→` keypress.  From EPUB_SCROLL_LINES (default 1).
+    pub epub_scroll_lines: usize,
+    /// Auto-scroll speed in lines/min.  0 = disabled.  From EPUB_AUTOSCROLL.
+    pub epub_autoscroll_lpm: f64,
+    /// Fractional-line accumulator for sub-line auto-scroll precision.
+    pub epub_autoscroll_accum: f64,
+    /// Seconds since last auto-save of epub_position.txt during auto-scroll.
+    pub epub_autosave_accum: f64,
+    /// Last known pane width used for wrapping; triggers rewrap on change.
+    pub epub_pane_width: u16,
+
     // ── Quit flag ─────────────────────────────────────────────────────────
     pub should_quit: bool,
 }
@@ -160,6 +175,28 @@ impl App {
             .unwrap_or(1.0)
             .max(0.0);
 
+        // Read EPUB_SCROLL_LINES / EPUB_AUTOSCROLL from environment.
+        let epub_scroll_lines = std::env::var("EPUB_SCROLL_LINES")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1);
+        let epub_autoscroll_lpm = std::env::var("EPUB_AUTOSCROLL")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(0.0)
+            .max(0.0);
+
+        // Load EPUB if the book directory is already known.
+        let epub = if !session.book.is_empty() {
+            EpubReader::load(&session.output_dir(), 80)
+                .ok()
+                .flatten()
+                .map(|mut r| { r.restore_position(); r })
+        } else {
+            None
+        };
+
         App {
             session,
             mode,
@@ -193,6 +230,12 @@ impl App {
             precheck_done: false,
             discard_short_clips,
             discard_duration_secs,
+            epub,
+            epub_scroll_lines,
+            epub_autoscroll_lpm,
+            epub_autoscroll_accum: 0.0,
+            epub_autosave_accum: 0.0,
+            epub_pane_width: 0,
             should_quit: false,
         }
     }
@@ -217,6 +260,28 @@ impl App {
         }
     }
 
+    // ── EPUB loading ──────────────────────────────────────────────────────────
+
+    /// (Re-)discover and load the EPUB from the current book directory.
+    /// Called on startup (if book is known) and whenever the book changes.
+    pub fn load_epub(&mut self) {
+        self.epub = EpubReader::load(&self.session.output_dir(), self.epub_pane_width.max(80))
+            .ok()
+            .flatten()
+            .map(|mut r| { r.restore_position(); r });
+    }
+
+    /// Called by the render loop when the terminal width changes so the EPUB
+    /// text is re-wrapped and the scroll position is restored from char_offset.
+    pub fn epub_set_pane_width(&mut self, w: u16) {
+        if w != self.epub_pane_width {
+            self.epub_pane_width = w;
+            if let Some(ref mut epub) = self.epub {
+                epub.rewrap(w);
+            }
+        }
+    }
+
     // ── Keyboard handling ─────────────────────────────────────────────────────
 
     /// Handle a raw key event.  Returns true if the app should quit.
@@ -227,6 +292,25 @@ impl App {
         {
             self.emergency_stop();
             return true;
+        }
+
+        // ← / → scroll the EPUB pane in all modes (if an EPUB is loaded).
+        match key.code {
+            KeyCode::Left => {
+                if let Some(ref mut epub) = self.epub {
+                    epub.scroll_by(-(self.epub_scroll_lines as isize));
+                    let _ = epub.save_position();
+                }
+                return self.should_quit;
+            }
+            KeyCode::Right => {
+                if let Some(ref mut epub) = self.epub {
+                    epub.scroll_by(self.epub_scroll_lines as isize);
+                    let _ = epub.save_position();
+                }
+                return self.should_quit;
+            }
+            _ => {}
         }
 
         match self.mode {
@@ -320,6 +404,10 @@ impl App {
 
         let _ = session::save(&self.session);
         self.setup_error = None;
+
+        // (Re-)load the EPUB whenever the book directory may have changed.
+        self.load_epub();
+
         self.mode = AppMode::Ready;
     }
 
@@ -739,6 +827,27 @@ impl App {
             AppMode::Recording => self.tick_recording(),
             AppMode::PunchRollback => self.tick_punch_rollback(),
             _ => {}
+        }
+
+        // Auto-scroll the EPUB only while actively recording.
+        if self.mode == AppMode::Recording && self.epub_autoscroll_lpm > 0.0 {
+            const TICK_SECS: f64 = 0.040; // matches the 40 ms poll interval in main.rs
+            self.epub_autoscroll_accum += self.epub_autoscroll_lpm / 60.0 * TICK_SECS;
+            if self.epub_autoscroll_accum >= 1.0 {
+                let steps = self.epub_autoscroll_accum as isize;
+                if let Some(ref mut epub) = self.epub {
+                    epub.scroll_by(steps);
+                }
+                self.epub_autoscroll_accum -= steps as f64;
+
+                self.epub_autosave_accum += steps as f64 * TICK_SECS;
+                if self.epub_autosave_accum >= 5.0 {
+                    if let Some(ref epub) = self.epub {
+                        let _ = epub.save_position();
+                    }
+                    self.epub_autosave_accum = 0.0;
+                }
+            }
         }
     }
 

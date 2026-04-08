@@ -110,6 +110,31 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 // ── Body ──────────────────────────────────────────────────────────────────────
 
 fn draw_body(f: &mut Frame, app: &App, area: Rect) {
+    // When an EPUB is loaded, split the body vertically: recording pane on top,
+    // EPUB pane on the bottom.  EPUB_PANE_RATIO controls the bottom share (%).
+    if app.epub.is_some() {
+        let ratio = std::env::var("EPUB_PANE_RATIO")
+            .ok()
+            .and_then(|v| v.trim().parse::<u16>().ok())
+            .unwrap_or(60)
+            .clamp(10, 90);
+        let bottom_pct = ratio;
+        let top_pct = 100 - bottom_pct;
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(top_pct),
+                Constraint::Percentage(bottom_pct),
+            ])
+            .split(area);
+        draw_body_mode(f, app, chunks[0]);
+        draw_epub_pane(f, app, chunks[1]);
+    } else {
+        draw_body_mode(f, app, area);
+    }
+}
+
+fn draw_body_mode(f: &mut Frame, app: &App, area: Rect) {
     match app.mode {
         AppMode::Setup => draw_setup(f, app, area),
         AppMode::Ready => draw_ready(f, app, area),
@@ -119,6 +144,81 @@ fn draw_body(f: &mut Frame, app: &App, area: Rect) {
         AppMode::PunchRollback => draw_punch_rollback(f, app, area),
         AppMode::MicError => draw_mic_error(f, app, area),
         AppMode::Fatal => draw_fatal(f, app, area),
+    }
+}
+
+fn draw_epub_pane(f: &mut Frame, app: &App, area: Rect) {
+    let epub = match &app.epub {
+        Some(e) => e,
+        None => return,
+    };
+
+    let autoscroll_active =
+        app.epub_autoscroll_lpm > 0.0 && app.mode == crate::app::AppMode::Recording;
+
+    let title = if autoscroll_active {
+        format!(
+            " EPUB: {} [auto-scroll {:.0} lpm] ",
+            epub.epub_filename(),
+            app.epub_autoscroll_lpm
+        )
+    } else {
+        format!(" EPUB: {} ", epub.epub_filename())
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(DARK_GRAY))
+        .title(Span::styled(title, dim()));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    // How many text rows fit inside the bordered pane.
+    let visible_height = inner.height as usize;
+    if visible_height == 0 {
+        return;
+    }
+
+    let lines = epub.visible_lines(visible_height);
+    let progress = format!(
+        " {}/{} ",
+        epub.scroll + 1,
+        epub.total_lines()
+    );
+
+    // Render each visible line.
+    let text_lines: Vec<Line> = lines
+        .iter()
+        .enumerate()
+        .map(|(i, text)| {
+            if i == 0 {
+                // Highlight the top (current) line so the user can see their place.
+                Line::from(Span::styled(
+                    text.clone(),
+                    Style::default().fg(WHITE).add_modifier(Modifier::UNDERLINED),
+                ))
+            } else {
+                Line::from(Span::raw(text.clone()))
+            }
+        })
+        .collect();
+
+    f.render_widget(
+        Paragraph::new(text_lines).wrap(Wrap { trim: false }),
+        inner,
+    );
+
+    // Progress indicator in the bottom-right corner of the inner area.
+    if inner.height > 0 {
+        let prog_len = progress.len() as u16;
+        let prog_x = inner.x + inner.width.saturating_sub(prog_len);
+        let prog_y = inner.y + inner.height.saturating_sub(1);
+        let prog_rect = Rect::new(prog_x, prog_y, prog_len.min(inner.width), 1);
+        f.render_widget(
+            Paragraph::new(Span::styled(progress, dim())),
+            prog_rect,
+        );
     }
 }
 
@@ -569,7 +669,7 @@ fn draw_fatal(f: &mut Frame, app: &App, area: Rect) {
 // ── Footer ────────────────────────────────────────────────────────────────────
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
-    let keys: &str = match app.mode {
+    let mode_keys: &str = match app.mode {
         AppMode::Setup => "[Enter] Confirm   [Tab] Switch field   [Esc] Cancel",
         AppMode::Ready => "[Space] Start recording   [E] Edit session   [R] Re-detect mic   [Q] Quit",
         AppMode::PreCheck => "[Esc] Abort check",
@@ -578,6 +678,12 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         AppMode::PunchRollback => "[Space] Punch in here   [Esc] Cancel",
         AppMode::MicError => "[R] Retry detection   [Q] Quit",
         AppMode::Fatal => "[Q] Quit",
+    };
+
+    let keys = if app.epub.is_some() {
+        format!("{}   [← →] Scroll text", mode_keys)
+    } else {
+        mode_keys.to_string()
     };
 
     f.render_widget(
