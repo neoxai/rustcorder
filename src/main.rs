@@ -8,6 +8,7 @@ mod playback;
 mod render;
 mod session;
 mod wav;
+mod web;
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -73,6 +74,19 @@ fn main() -> Result<()> {
         return playback::run(player_type, &file);
     }
 
+    // Start the local web server before entering the TUI.  It has no
+    // dependency on the terminal and should run for the full process lifetime.
+    // Returns the bound port, or an error if no port in the search range is free.
+    let web_port = web::spawn()?;
+
+    let web_mode = std::env::var("WEB_MODE")
+        .map(|v| v.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    if web_mode {
+        return run_headless(web_port);
+    }
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -84,6 +98,33 @@ fn main() -> Result<()> {
     let _ = execute!(io::stdout(), LeaveAlternateScreen);
 
     result
+}
+
+fn run_headless(port: u16) -> Result<()> {
+    eprintln!("rustcorder [WEB_MODE]: open http://localhost:{port}/ in your browser");
+    eprintln!("rustcorder [WEB_MODE]: press Ctrl-C to quit");
+
+    let sigterm = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&sigterm))?;
+
+    let mut app = App::new();
+    app.detect_mic();
+
+    loop {
+        if sigterm.load(Ordering::Relaxed) {
+            app.emergency_stop();
+        }
+        if app.should_quit {
+            break;
+        }
+        app.tick();
+        if app.should_quit {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(40));
+    }
+
+    Ok(())
 }
 
 fn run() -> Result<()> {
