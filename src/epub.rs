@@ -1,9 +1,13 @@
 //! EPUB loading, text extraction, line-wrapping, and scroll-position management.
 //!
-//! Position is tracked as a **character offset** into the full extracted plain
-//! text (all spine items concatenated, before wrapping).  This is
-//! layout-independent: the terminal can be resized at any time and
-//! `rewrap()` will restore the correct scroll line from the saved offset.
+//! Position is tracked as an **`EpubCfi`** — a simplified EPUB Canonical
+//! Fragment Identifier of the form `epubcfi(/6/N!/1:C)` where `N` is the
+//! even-numbered spine-child index and `C` is the character offset within
+//! that spine item's extracted plain text.
+//!
+//! CFI is epub.js's native format, so it can be used on both the Rust side
+//! (terminal display) and the browser side (epub.js rendition) without any
+//! conversion layer.
 
 use std::fs;
 use std::io::Write as _;
@@ -11,6 +15,57 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use epub::doc::EpubDoc;
+
+// ── CFI type ──────────────────────────────────────────────────────────────────
+
+/// A simplified EPUB CFI pointing to a character position within a spine item.
+///
+/// Serialises to/from `epubcfi(/6/N!/1:C)`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EpubCfi {
+    /// Even-numbered spine-child index (2 = first spine item, 4 = second, …).
+    pub spine_child: u32,
+    /// Character offset within that spine item's extracted plain text.
+    pub char_offset: u32,
+}
+
+impl EpubCfi {
+    /// The CFI for the very beginning of the first spine item.
+    pub fn zero() -> Self {
+        EpubCfi { spine_child: 2, char_offset: 0 }
+    }
+
+    /// Serialise to the canonical string used in `epub_position.txt` and JSON.
+    pub fn to_cfi_string(&self) -> String {
+        format!("epubcfi(/6/{}!/1:{})", self.spine_child, self.char_offset)
+    }
+
+    /// Parse `epubcfi(/6/N!/1:C)`.  Lenient: extracts the last `/N` before `!`
+    /// and the last `:C` in the string.  Returns `None` on any parse failure.
+    pub fn parse(s: &str) -> Option<Self> {
+        // Must start with the epubcfi scheme.
+        let inner = s.strip_prefix("epubcfi(")?
+            .strip_suffix(')')?;
+
+        // Split on '!' to separate spine path from content path.
+        let bang = inner.find('!')?;
+        let spine_path = &inner[..bang];   // e.g. "/6/4"
+        let content_path = &inner[bang+1..]; // e.g. "/1:48372"
+
+        // Last numeric segment in spine_path is the spine_child.
+        let spine_child: u32 = spine_path
+            .rsplit('/')
+            .find(|s| !s.is_empty())?
+            .parse()
+            .ok()?;
+
+        // Last ':N' in content_path is the character offset.
+        let colon = content_path.rfind(':')?;
+        let char_offset: u32 = content_path[colon+1..].parse().ok()?;
+
+        Some(EpubCfi { spine_child, char_offset })
+    }
+}
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -22,11 +77,14 @@ pub struct EpubReader {
     lines: Vec<String>,
     /// `line_offsets[i]` = char offset in `full_text` of `lines[i]`'s first char.
     line_offsets: Vec<usize>,
-    /// Char offset of the first char of the top visible line.
-    /// **Authoritative saved position** — survives terminal resize.
-    pub char_offset: usize,
+    /// Absolute char offset in `full_text` of the first character of each
+    /// spine item.  Length == number of spine items that contributed text.
+    spine_starts: Vec<usize>,
+    /// **Authoritative saved position** — a CFI pointing into the spine item
+    /// and character offset within it.  Survives terminal resize.
+    pub cfi: EpubCfi,
     /// Index into `lines` / `line_offsets` for the top visible line.
-    /// Always derived from `char_offset`; re-derived after every `rewrap`.
+    /// Always derived from `cfi`; re-derived after every `rewrap` or seek.
     pub scroll: usize,
     /// Filename of the source EPUB (stored in epub_position.txt).
     epub_filename: String,
@@ -50,7 +108,7 @@ impl EpubReader {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
 
-        let full_text = extract_text(&epub_path)?;
+        let (full_text, spine_starts) = extract_text(&epub_path)?;
         let width = inner_width(pane_width);
         let (lines, line_offsets) = wrap_text(&full_text, width);
 
@@ -58,7 +116,8 @@ impl EpubReader {
             full_text,
             lines,
             line_offsets,
-            char_offset: 0,
+            spine_starts,
+            cfi: EpubCfi::zero(),
             scroll: 0,
             epub_filename,
             book_dir: book_dir.to_path_buf(),
@@ -68,8 +127,8 @@ impl EpubReader {
     // ── Position persistence ──────────────────────────────────────────────
 
     /// Load `epub_position.txt` from the book directory and restore
-    /// `char_offset` + `scroll`.  Silently no-ops if the file is missing or
-    /// belongs to a different EPUB.
+    /// `cfi` + `scroll`.  Silently no-ops if the file is missing or
+    /// belongs to a different EPUB.  Old `CHAR_OFFSET=` lines are ignored.
     pub fn restore_position(&mut self) {
         let path = self.position_path();
         let text = match fs::read_to_string(&path) {
@@ -78,23 +137,21 @@ impl EpubReader {
         };
 
         let mut saved_epub = String::new();
-        let mut saved_offset: Option<usize> = None;
+        let mut saved_cfi: Option<EpubCfi> = None;
 
         for line in text.lines() {
             if let Some(v) = line.strip_prefix("EPUB=") {
                 saved_epub = v.trim().to_string();
-            } else if let Some(v) = line.strip_prefix("CHAR_OFFSET=") {
-                saved_offset = v.trim().parse().ok();
+            } else if let Some(v) = line.strip_prefix("CFI=") {
+                saved_cfi = EpubCfi::parse(v.trim());
             }
         }
 
-        // Only restore if the EPUB filename matches.
         if saved_epub != self.epub_filename {
             return;
         }
-        if let Some(offset) = saved_offset {
-            self.char_offset = offset.min(self.full_text.chars().count());
-            self.scroll = self.scroll_for_offset(self.char_offset);
+        if let Some(cfi) = saved_cfi {
+            self.seek_to_cfi(cfi);
         }
     }
 
@@ -107,18 +164,28 @@ impl EpubReader {
             .truncate(true)
             .open(&path)?;
         writeln!(f, "EPUB={}", self.epub_filename)?;
-        writeln!(f, "CHAR_OFFSET={}", self.char_offset)?;
+        writeln!(f, "CFI={}", self.cfi.to_cfi_string())?;
         Ok(())
     }
 
     // ── Scrolling ─────────────────────────────────────────────────────────
 
-    /// Scroll forward (`delta > 0`) or backward (`delta < 0`) by `|delta|` wrapped
-    /// lines.  Updates both `scroll` and `char_offset`.
+    /// Scroll forward (`delta > 0`) or backward (`delta < 0`) by `|delta|`
+    /// wrapped lines.  Updates both `scroll` and `cfi`.
     pub fn scroll_by(&mut self, delta: isize) {
         let max = self.lines.len().saturating_sub(1);
         self.scroll = (self.scroll as isize + delta).max(0).min(max as isize) as usize;
-        self.char_offset = self.line_offsets[self.scroll];
+        let flat = self.line_offsets[self.scroll];
+        self.cfi = self.flat_offset_to_cfi(flat);
+    }
+
+    /// Seek directly to a CFI position.  Updates both `cfi` and `scroll`.
+    pub fn seek_to_cfi(&mut self, cfi: EpubCfi) {
+        let flat = self.cfi_to_flat_offset(&cfi);
+        // Clamp to valid range.
+        let flat = flat.min(self.full_text.chars().count().saturating_sub(1));
+        self.scroll = self.scroll_for_offset(flat);
+        self.cfi = self.flat_offset_to_cfi(self.line_offsets[self.scroll]);
     }
 
     // ── Text access ───────────────────────────────────────────────────────
@@ -141,14 +208,46 @@ impl EpubReader {
 
     // ── Resize ────────────────────────────────────────────────────────────
 
-    /// Re-wrap all lines to a new pane width.  `scroll` is re-derived from
-    /// `char_offset` so the same passage stays at the top of the pane.
+    /// Re-wrap all lines to a new pane width.  `scroll` and `cfi` are
+    /// re-derived from the current `cfi` so the same passage stays at the top.
     pub fn rewrap(&mut self, new_pane_width: u16) {
         let width = inner_width(new_pane_width);
         let (lines, line_offsets) = wrap_text(&self.full_text, width);
         self.lines = lines;
         self.line_offsets = line_offsets;
-        self.scroll = self.scroll_for_offset(self.char_offset);
+        // Re-derive scroll from the unchanged cfi.
+        let flat = self.cfi_to_flat_offset(&self.cfi.clone());
+        self.scroll = self.scroll_for_offset(flat);
+    }
+
+    // ── CFI ↔ flat-offset conversion ──────────────────────────────────────
+
+    /// Convert a `EpubCfi` to an absolute character offset in `full_text`.
+    fn cfi_to_flat_offset(&self, cfi: &EpubCfi) -> usize {
+        // spine_child 2 → item index 0, 4 → 1, etc.
+        let item_idx = (cfi.spine_child / 2).saturating_sub(1) as usize;
+        let base = self.spine_starts.get(item_idx).copied().unwrap_or(0);
+        // Clamp within spine item length.
+        let next_base = self.spine_starts.get(item_idx + 1).copied()
+            .unwrap_or(self.full_text.chars().count());
+        let item_len = next_base.saturating_sub(base);
+        base + (cfi.char_offset as usize).min(item_len.saturating_sub(1).max(0))
+    }
+
+    /// Convert an absolute character offset in `full_text` to an `EpubCfi`.
+    fn flat_offset_to_cfi(&self, flat: usize) -> EpubCfi {
+        if self.spine_starts.is_empty() {
+            return EpubCfi { spine_child: 2, char_offset: flat as u32 };
+        }
+        // Last spine_starts entry that is <= flat.
+        let item_idx = self.spine_starts
+            .partition_point(|&s| s <= flat)
+            .saturating_sub(1);
+        let base = self.spine_starts[item_idx];
+        EpubCfi {
+            spine_child: (item_idx as u32 + 1) * 2,
+            char_offset: (flat - base) as u32,
+        }
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────
@@ -159,7 +258,6 @@ impl EpubReader {
 
     /// Binary-search `line_offsets` for the last entry whose offset ≤ `target`.
     fn scroll_for_offset(&self, target: usize) -> usize {
-        // `partition_point` finds the first index where the predicate is false.
         self.line_offsets
             .partition_point(|&o| o <= target)
             .saturating_sub(1)
@@ -183,23 +281,32 @@ fn find_epub(book_dir: &Path) -> Result<Option<PathBuf>> {
 
 // ── Text extraction ───────────────────────────────────────────────────────────
 
-fn extract_text(epub_path: &Path) -> Result<String> {
+/// Extract plain text from all spine items.
+///
+/// Returns `(full_text, spine_starts)` where `spine_starts[i]` is the char
+/// offset in `full_text` of the first character of spine item `i`.
+fn extract_text(epub_path: &Path) -> Result<(String, Vec<usize>)> {
     let mut doc = EpubDoc::new(epub_path)
         .map_err(|e| anyhow::anyhow!("EPUB open failed: {}", e))?;
 
     let n = doc.get_num_chapters();
     let mut full = String::new();
+    let mut spine_starts: Vec<usize> = Vec::new();
 
     for _ in 0..n {
         if let Some((html, mime)) = doc.get_current_str() {
-            // Skip non-HTML spine items (images, CSS, etc.)
             if mime.contains("html") || mime.contains("xhtml") {
                 let text = strip_html(&html);
                 let trimmed = text.trim();
                 if !trimmed.is_empty() {
+                    // Push the inter-item separator first, then record the
+                    // start offset, then push the text.  This way the start
+                    // is always the char offset of trimmed[0] in full_text.
                     if !full.is_empty() {
                         full.push('\n');
                     }
+                    let start = full.chars().count();
+                    spine_starts.push(start);
                     full.push_str(trimmed);
                 }
             }
@@ -207,7 +314,11 @@ fn extract_text(epub_path: &Path) -> Result<String> {
         doc.go_next();
     }
 
-    Ok(full)
+    if spine_starts.is_empty() {
+        spine_starts.push(0);
+    }
+
+    Ok((full, spine_starts))
 }
 
 // ── HTML stripping ────────────────────────────────────────────────────────────
@@ -335,7 +446,6 @@ fn normalize_whitespace(s: &str) -> String {
         match ch {
             '\n' => {
                 if in_space {
-                    // flush any pending space before the newline
                     in_space = false;
                 }
                 if prev_newline_count < 2 {
@@ -345,9 +455,8 @@ fn normalize_whitespace(s: &str) -> String {
             }
             ' ' | '\t' | '\r' => {
                 if prev_newline_count == 0 {
-                    in_space = true; // collapse to single space later
+                    in_space = true;
                 }
-                // Whitespace after newline is dropped (leading indent removed).
             }
             _ => {
                 if in_space {
@@ -379,7 +488,6 @@ pub fn wrap_text(text: &str, width: usize) -> (Vec<String>, Vec<usize>) {
         return (lines, offsets);
     }
 
-    // Char offset of the start of the current paragraph within `text`.
     let mut para_start: usize = 0;
 
     for para in text.split('\n') {
@@ -388,11 +496,10 @@ pub fn wrap_text(text: &str, width: usize) -> (Vec<String>, Vec<usize>) {
         if para.trim().is_empty() {
             lines.push(String::new());
             offsets.push(para_start);
-            para_start += para_char_count + 1; // +1 for the '\n' separator
+            para_start += para_char_count + 1;
             continue;
         }
 
-        // Collect (char_offset_within_para, word) pairs.
         let mut words: Vec<(usize, &str)> = Vec::new();
         let mut in_word = false;
         let mut word_start_byte = 0usize;
@@ -418,9 +525,8 @@ pub fn wrap_text(text: &str, width: usize) -> (Vec<String>, Vec<usize>) {
             words.push((word_start_char, &para[word_start_byte..]));
         }
 
-        // Greedy wrap: build lines, recording the char offset of each line start.
         let mut cur_line = String::new();
-        let mut line_start_char: usize = 0; // offset within paragraph
+        let mut line_start_char: usize = 0;
 
         for (word_char_off, word) in &words {
             let word_len = word.chars().count();
@@ -431,7 +537,6 @@ pub fn wrap_text(text: &str, width: usize) -> (Vec<String>, Vec<usize>) {
             };
 
             if !cur_line.is_empty() && needed > width {
-                // Emit completed line.
                 lines.push(cur_line.clone());
                 offsets.push(para_start + line_start_char);
                 cur_line.clear();
@@ -444,7 +549,6 @@ pub fn wrap_text(text: &str, width: usize) -> (Vec<String>, Vec<usize>) {
             cur_line.push_str(word);
         }
 
-        // Emit final (possibly only) line of this paragraph.
         if !cur_line.is_empty() {
             lines.push(cur_line);
             offsets.push(para_start + line_start_char);
@@ -465,7 +569,7 @@ pub fn wrap_text(text: &str, width: usize) -> (Vec<String>, Vec<usize>) {
 
 /// Usable text columns inside the bordered pane for a given terminal width.
 fn inner_width(pane_width: u16) -> usize {
-    pane_width.saturating_sub(2) as usize // 1 char border each side
+    pane_width.saturating_sub(2) as usize
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -488,11 +592,13 @@ mod tests {
         assert!(!reader.full_text.is_empty(), "extracted text should not be empty");
         assert!(reader.full_text.len() > 1000, "should have extracted a reasonable amount of text");
         assert_eq!(reader.lines.len(), reader.line_offsets.len(), "lines/offsets must match");
-        // Verify a few lines from the known book
+        assert!(!reader.spine_starts.is_empty(), "spine_starts must not be empty");
+        assert_eq!(reader.spine_starts[0], 0, "first spine item must start at offset 0");
         let full = &reader.full_text;
         assert!(full.contains("Ralph") || full.contains("mouse") || full.contains("motorcycle"),
             "should contain expected book content");
-        println!("Extracted {} chars, {} wrapped lines", full.len(), reader.lines.len());
+        println!("Extracted {} chars, {} wrapped lines, {} spine items",
+            full.len(), reader.lines.len(), reader.spine_starts.len());
         println!("First 200 chars: {:?}", &full[..full.len().min(200)]);
     }
 
@@ -501,16 +607,12 @@ mod tests {
         let text = "The quick brown fox jumps over the lazy dog";
         let (lines, offsets) = wrap_text(text, 20);
         assert_eq!(lines.len(), offsets.len());
-        // Every line should fit within 20 chars (allowing for the word that pushed it over)
         for line in &lines {
-            // individual words can exceed width; full lines should be reasonable
             assert!(line.len() <= 25, "line too long: {:?}", line);
         }
-        // Offsets should be monotonically increasing
         for i in 1..offsets.len() {
             assert!(offsets[i] >= offsets[i - 1], "offsets not monotonic");
         }
-        // First offset is always 0
         assert_eq!(offsets[0], 0);
     }
 
@@ -519,17 +621,59 @@ mod tests {
         let dir = Path::new(TEST_EPUB_DIR);
         if !dir.exists() { return; }
         let mut reader = EpubReader::load(dir, 80).unwrap().unwrap();
-        // Scroll forward 50 lines
         reader.scroll_by(50);
-        let saved_offset = reader.char_offset;
-        // Rewrap at a different width
+        let saved_cfi = reader.cfi.clone();
         reader.rewrap(60);
-        // char_offset must be unchanged
-        assert_eq!(reader.char_offset, saved_offset, "char_offset should survive rewrap");
-        // scroll should map to a line whose offset <= saved_offset
-        assert!(reader.line_offsets[reader.scroll] <= saved_offset);
+        // CFI must be unchanged after rewrap.
+        assert_eq!(reader.cfi, saved_cfi, "cfi should survive rewrap");
+        // scroll should map to a line whose offset <= flat offset of cfi.
+        let flat = reader.cfi_to_flat_offset(&reader.cfi);
+        assert!(reader.line_offsets[reader.scroll] <= flat);
         if reader.scroll + 1 < reader.line_offsets.len() {
-            assert!(reader.line_offsets[reader.scroll + 1] > saved_offset);
+            assert!(reader.line_offsets[reader.scroll + 1] > flat);
         }
+    }
+
+    #[test]
+    fn cfi_parse_roundtrip() {
+        let cases = [
+            EpubCfi { spine_child: 2,  char_offset: 0     },
+            EpubCfi { spine_child: 4,  char_offset: 48372 },
+            EpubCfi { spine_child: 10, char_offset: 1     },
+        ];
+        for cfi in &cases {
+            let s = cfi.to_cfi_string();
+            let parsed = EpubCfi::parse(&s)
+                .unwrap_or_else(|| panic!("failed to parse: {}", s));
+            assert_eq!(parsed, *cfi, "round-trip failed for {}", s);
+        }
+    }
+
+    #[test]
+    fn cfi_flat_offset_roundtrip() {
+        let dir = Path::new(TEST_EPUB_DIR);
+        if !dir.exists() { return; }
+        let mut reader = EpubReader::load(dir, 80).unwrap().unwrap();
+
+        // Test several scroll positions throughout the book.
+        let step = reader.lines.len() / 20;
+        for i in (0..reader.lines.len()).step_by(step.max(1)) {
+            let flat_original = reader.line_offsets[i];
+            let cfi = reader.flat_offset_to_cfi(flat_original);
+            let flat_roundtrip = reader.cfi_to_flat_offset(&cfi);
+            // Allow off-by-one at spine boundaries due to clamping.
+            assert!(
+                flat_roundtrip.abs_diff(flat_original) <= 1,
+                "round-trip mismatch at line {}: flat {} → cfi {} → flat {}",
+                i, flat_original, cfi.to_cfi_string(), flat_roundtrip
+            );
+        }
+
+        // seek_to_cfi should land on the correct scroll line.
+        reader.scroll_by(100);
+        let cfi = reader.cfi.clone();
+        let scroll_before = reader.scroll;
+        reader.seek_to_cfi(cfi);
+        assert_eq!(reader.scroll, scroll_before, "seek_to_cfi should restore scroll");
     }
 }
