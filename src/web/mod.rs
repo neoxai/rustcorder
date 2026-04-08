@@ -3,9 +3,10 @@
 //! Binds to `127.0.0.1:<BROWSER_PORT>` (default 7474).
 //!
 //! Routes:
-//!   GET  /       — hello-world HTML (Phase 1; replaced by viewer in Phase 3)
-//!   GET  /state  — current `BrowserState` as JSON
-//!   WS   /ws     — real-time `BrowserState` push; one JSON frame per state change
+//!   GET  /       — epub.js viewer (index.html)
+//!   GET  /epub   — raw .epub file served to epub.js
+//!   GET  /state  — current `BrowserState` as JSON (one-shot)
+//!   WS   /ws     — real-time state push + incoming actions
 
 pub mod state;
 
@@ -17,26 +18,32 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
+    http::{header, StatusCode},
     response::IntoResponse,
     routing::get,
     Router,
 };
 use tokio::sync::watch;
 
-use state::{BrowserState, StateTx};
+use state::{ActionTx, ActionRx, BrowserState, StateTx, WebAction};
 
 const DEFAULT_PORT: u16 = 7474;
 const PORT_SEARCH_RANGE: u16 = 10;
 
+// ── Shared server state ───────────────────────────────────────────────────────
+
+struct ServerState {
+    rx: watch::Receiver<BrowserState>,
+    action_tx: ActionTx,
+}
+
 // ── Spawn ─────────────────────────────────────────────────────────────────────
 
-/// Bind a TCP listener on the configured port, trying up to
-/// `PORT_SEARCH_RANGE` sequential ports if the preferred one is taken.
-///
-/// Returns `(bound_port, state_sender)`.  Push new `BrowserState` snapshots
-/// into `state_sender` on every app tick; connected WebSocket clients and
-/// `GET /state` callers will see them immediately.
-pub fn spawn() -> Result<(u16, StateTx)> {
+/// Bind, spawn the server thread, and return:
+/// - the bound port
+/// - `StateTx` to push state snapshots from the app loop
+/// - `ActionRx` to drain browser actions (epub_seek, etc.) from the app loop
+pub fn spawn() -> Result<(u16, StateTx, ActionRx)> {
     let start = std::env::var("BROWSER_PORT")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -57,32 +64,39 @@ pub fn spawn() -> Result<(u16, StateTx)> {
 
     std_listener.set_nonblocking(true)?;
 
-    // watch channel: the main loop sends snapshots; axum handlers read them.
-    let (tx, rx) = watch::channel(BrowserState::default());
-    let shared = Arc::new(rx);
+    let (state_tx, state_rx) = watch::channel(BrowserState::default());
+    // Sync channel with a small buffer so WebSocket handlers never block the
+    // audio thread even if the main loop is briefly slow.
+    let (action_tx, action_rx) = std::sync::mpsc::sync_channel::<WebAction>(32);
+
+    let server_state = Arc::new(ServerState {
+        rx: state_rx,
+        action_tx,
+    });
 
     std::thread::spawn(move || {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .expect("tokio runtime")
-            .block_on(serve(std_listener, shared));
+            .block_on(serve(std_listener, server_state));
     });
 
-    Ok((port, tx))
+    Ok((port, state_tx, action_rx))
 }
 
 // ── Server ────────────────────────────────────────────────────────────────────
 
 async fn serve(
     std_listener: std::net::TcpListener,
-    rx: Arc<watch::Receiver<BrowserState>>,
+    server_state: Arc<ServerState>,
 ) {
     let app = Router::new()
         .route("/", get(index))
+        .route("/epub", get(epub_handler))
         .route("/state", get(state_handler))
         .route("/ws", get(ws_handler))
-        .with_state(rx);
+        .with_state(server_state);
 
     let listener = tokio::net::TcpListener::from_std(std_listener)
         .expect("convert std listener to tokio");
@@ -95,63 +109,89 @@ async fn serve(
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
 async fn index() -> axum::response::Html<&'static str> {
-    axum::response::Html(
-        r#"<!doctype html>
-<html lang="en">
-<head><meta charset="utf-8"><title>rustcorder</title></head>
-<body>
-  <h1>rustcorder</h1>
-  <p>Web UI coming soon (Phase 3).</p>
-  <p>Current state: <a href="/state">/state</a></p>
-  <p>WebSocket: <code>ws://localhost:PORT/ws</code></p>
-</body>
-</html>"#,
-    )
+    axum::response::Html(include_str!("../../static/index.html"))
+}
+
+async fn epub_handler(
+    State(ss): State<Arc<ServerState>>,
+) -> impl IntoResponse {
+    let path = ss.rx.borrow().epub_path.clone();
+    match path {
+        None => (StatusCode::NOT_FOUND, "No EPUB loaded").into_response(),
+        Some(p) => match tokio::fs::read(&p).await {
+            Ok(bytes) => (
+                [(header::CONTENT_TYPE, "application/epub+zip")],
+                bytes,
+            )
+                .into_response(),
+            Err(e) => (
+                StatusCode::NOT_FOUND,
+                format!("Could not read EPUB: {e}"),
+            )
+                .into_response(),
+        },
+    }
 }
 
 async fn state_handler(
-    State(rx): State<Arc<watch::Receiver<BrowserState>>>,
+    State(ss): State<Arc<ServerState>>,
 ) -> axum::Json<BrowserState> {
-    axum::Json(rx.borrow().clone())
+    axum::Json(ss.rx.borrow().clone())
 }
 
 async fn ws_handler(
     ws: WebSocketUpgrade,
-    State(rx): State<Arc<watch::Receiver<BrowserState>>>,
+    State(ss): State<Arc<ServerState>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(|socket| handle_socket(socket, rx))
+    ws.on_upgrade(|socket| handle_socket(socket, ss))
 }
 
-async fn handle_socket(mut socket: WebSocket, rx: Arc<watch::Receiver<BrowserState>>) {
-    // Clone a new receiver so this connection has its own change cursor.
-    let mut rx = (*rx).clone();
+// ── WebSocket connection ───────────────────────────────────────────────────────
 
-    // Send the current state immediately on connect.
+async fn handle_socket(mut socket: WebSocket, ss: Arc<ServerState>) {
+    let mut rx = ss.rx.clone();
+
+    // Send current state immediately on connect.
     let initial = serde_json::to_string(&*rx.borrow()).unwrap_or_default();
     if socket.send(Message::Text(initial)).await.is_err() {
         return;
     }
 
-    // Stream every subsequent change until the client disconnects.
     loop {
         tokio::select! {
-            // New state available.
+            // New state snapshot available — push to client.
             result = rx.changed() => {
-                if result.is_err() {
-                    break; // sender dropped (process shutting down)
-                }
+                if result.is_err() { break; }
                 let json = serde_json::to_string(&*rx.borrow()).unwrap_or_default();
-                if socket.send(Message::Text(json)).await.is_err() {
-                    break; // client disconnected
-                }
+                if socket.send(Message::Text(json)).await.is_err() { break; }
             }
-            // Client sent something (close frame, ping, etc.).
+
+            // Incoming message from browser.
             msg = socket.recv() => {
                 match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        handle_browser_message(&text, &ss.action_tx);
+                    }
                     Some(Ok(Message::Close(_))) | None => break,
-                    _ => {} // ignore other client messages for now (Phase 4 adds actions)
+                    _ => {}
                 }
             }
         }
+    }
+}
+
+/// Parse a JSON action message from the browser and forward it to the app loop.
+fn handle_browser_message(text: &str, action_tx: &ActionTx) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        return;
+    };
+    match v.get("action").and_then(|a| a.as_str()) {
+        Some("epub_seek") => {
+            let cfi_str = v.get("cfi").and_then(|c| c.as_str()).unwrap_or("");
+            if let Some(cfi) = crate::epub::EpubCfi::parse(cfi_str) {
+                let _ = action_tx.try_send(WebAction::EpubSeek(cfi));
+            }
+        }
+        _ => {} // unknown actions ignored; Phase 4 adds more
     }
 }

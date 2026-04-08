@@ -1,4 +1,4 @@
-//! Shared state snapshot sent to browser clients.
+//! Shared state snapshot sent to browser clients, and action back-channel.
 
 use serde::Serialize;
 
@@ -6,8 +6,8 @@ use crate::app::{App, AppMode};
 
 // ── BrowserState ──────────────────────────────────────────────────────────────
 
-/// Minimal, cheaply-cloneable snapshot of `App` that is broadcast to all
-/// connected browser clients via the WebSocket and served at `GET /state`.
+/// Minimal, cheaply-cloneable snapshot of `App` broadcast to all connected
+/// browser clients via WebSocket and served at `GET /state`.
 #[derive(Clone, Debug, Serialize)]
 pub struct BrowserState {
     /// Current recorder mode, e.g. `"Recording"`, `"Ready"`.
@@ -23,6 +23,10 @@ pub struct BrowserState {
     pub silence_warning: bool,
     /// Current EPUB position as a CFI string, or `null` when no EPUB is loaded.
     pub epub_cfi: Option<String>,
+    /// Absolute filesystem path to the `.epub` file served by `GET /epub`.
+    /// `null` when no EPUB is loaded.  Not shown in the browser UI; used
+    /// internally by the `/epub` endpoint.
+    pub epub_path: Option<String>,
     /// Absolute timeline position in seconds for the current chapter.
     pub timeline_pos_secs: f64,
     /// Key-hint string matching the TUI footer for the current mode.
@@ -40,6 +44,7 @@ impl Default for BrowserState {
             rms_dbfs: -100.0,
             silence_warning: false,
             epub_cfi: None,
+            epub_path: None,
             timeline_pos_secs: 0.0,
             footer_hints: String::new(),
         }
@@ -68,6 +73,15 @@ impl BrowserState {
 
         let epub_cfi = app.epub.as_ref().map(|e| e.cfi.to_cfi_string());
 
+        // Build the epub filesystem path from session dir + epub filename.
+        let epub_path = app.epub.as_ref().map(|e| {
+            app.session
+                .output_dir()
+                .join(e.epub_filename())
+                .to_string_lossy()
+                .into_owned()
+        });
+
         let mode_keys = match app.mode {
             AppMode::Setup => "[Enter] Confirm   [Tab] Switch field   [Esc] Cancel",
             AppMode::Ready => "[Space] Start   [E] Edit session   [R] Re-detect mic   [Q] Quit",
@@ -93,13 +107,27 @@ impl BrowserState {
             rms_dbfs: app.last_rms_db,
             silence_warning: app.silence_warning,
             epub_cfi,
+            epub_path,
             timeline_pos_secs: app.session.timeline_pos,
             footer_hints,
         }
     }
 }
 
+// ── Action back-channel ───────────────────────────────────────────────────────
+
+/// Actions the browser can send back to the main app loop.
+pub enum WebAction {
+    /// User scrolled the epub.js rendition; update the Rust position.
+    EpubSeek(crate::epub::EpubCfi),
+}
+
+/// Sender half — held by each WebSocket connection handler.
+pub type ActionTx = std::sync::mpsc::SyncSender<WebAction>;
+/// Receiver half — held by the main app loop and drained each tick.
+pub type ActionRx = std::sync::mpsc::Receiver<WebAction>;
+
 // ── Convenience alias ─────────────────────────────────────────────────────────
 
-/// The sender half of the watch channel; passed into `App`'s event loop.
+/// The sender half of the state watch channel; passed into the app event loop.
 pub type StateTx = tokio::sync::watch::Sender<BrowserState>;

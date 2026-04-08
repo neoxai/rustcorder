@@ -24,7 +24,7 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, Terminal};
 
 use app::App;
-use web::state::{BrowserState, StateTx};
+use web::state::{ActionRx, BrowserState, StateTx, WebAction};
 
 fn main() -> Result<()> {
     // Load .env from the current working directory into the process environment.
@@ -75,23 +75,23 @@ fn main() -> Result<()> {
         return playback::run(player_type, &file);
     }
 
-    // Start the local web server.  Returns the bound port and a channel sender
-    // for pushing state snapshots to connected clients.
-    let (web_port, state_tx) = web::spawn()?;
+    // Start the local web server.  Returns the bound port, a channel sender
+    // for pushing state snapshots, and a receiver for browser actions.
+    let (web_port, state_tx, action_rx) = web::spawn()?;
 
     let web_mode = std::env::var("WEB_MODE")
         .map(|v| v.trim().eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
     if web_mode {
-        return run_headless(web_port, state_tx);
+        return run_headless(web_port, state_tx, action_rx);
     }
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
 
-    let result = run(state_tx);
+    let result = run(state_tx, action_rx);
 
     // Always restore terminal, even on error.
     let _ = disable_raw_mode();
@@ -100,7 +100,24 @@ fn main() -> Result<()> {
     result
 }
 
-fn run_headless(port: u16, state_tx: StateTx) -> Result<()> {
+// ── Drain browser actions ─────────────────────────────────────────────────────
+
+fn drain_actions(app: &mut App, action_rx: &ActionRx) {
+    while let Ok(action) = action_rx.try_recv() {
+        match action {
+            WebAction::EpubSeek(cfi) => {
+                if let Some(ref mut epub) = app.epub {
+                    epub.seek_to_cfi(cfi);
+                    let _ = epub.save_position();
+                }
+            }
+        }
+    }
+}
+
+// ── Headless loop ─────────────────────────────────────────────────────────────
+
+fn run_headless(port: u16, state_tx: StateTx, action_rx: ActionRx) -> Result<()> {
     eprintln!("rustcorder [WEB_MODE]: open http://localhost:{port}/ in your browser");
     eprintln!("rustcorder [WEB_MODE]: press Ctrl-C to quit");
 
@@ -114,23 +131,22 @@ fn run_headless(port: u16, state_tx: StateTx) -> Result<()> {
         if sigterm.load(Ordering::Relaxed) {
             app.emergency_stop();
         }
-        if app.should_quit {
-            break;
-        }
+        if app.should_quit { break; }
+
+        drain_actions(&mut app, &action_rx);
         app.tick();
         let _ = state_tx.send(BrowserState::from_app(&app));
-        if app.should_quit {
-            break;
-        }
+
+        if app.should_quit { break; }
         std::thread::sleep(Duration::from_millis(40));
     }
 
     Ok(())
 }
 
-fn run(state_tx: StateTx) -> Result<()> {
-    // Register a SIGTERM handler so the app can shut down cleanly when asked
-    // to exit by the OS / process manager.
+// ── TUI loop ──────────────────────────────────────────────────────────────────
+
+fn run(state_tx: StateTx, action_rx: ActionRx) -> Result<()> {
     let sigterm = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&sigterm))?;
 
@@ -138,14 +154,13 @@ fn run(state_tx: StateTx) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new();
-
-    // Attempt initial mic detection (non-fatal; UI will show the error).
     app.detect_mic();
 
     loop {
+        // ── Drain browser actions ─────────────────────────────────────────
+        drain_actions(&mut app, &action_rx);
+
         // ── Render ────────────────────────────────────────────────────────
-        // Inform the app of the current terminal width so the EPUB pane can
-        // re-wrap if the terminal was resized since the last frame.
         let epub_pane_width = terminal.size().map(|s| s.width).unwrap_or(80);
         app.epub_set_pane_width(epub_pane_width);
         terminal.draw(|f| render::draw(f, &app))?;
@@ -157,26 +172,18 @@ fn run(state_tx: StateTx) -> Result<()> {
         if sigterm.load(Ordering::Relaxed) {
             app.emergency_stop();
         }
-
-        if app.should_quit {
-            break;
-        }
+        if app.should_quit { break; }
 
         // ── Handle input events (non-blocking, 40 ms poll) ────────────────
         if event::poll(Duration::from_millis(40))? {
             if let Event::Key(key) = event::read()? {
-                if app.handle_key(key) {
-                    break;
-                }
+                if app.handle_key(key) { break; }
             }
         }
 
-        // ── Tick: drain audio channel, advance state ───────────────────────
+        // ── Tick ──────────────────────────────────────────────────────────
         app.tick();
-
-        if app.should_quit {
-            break;
-        }
+        if app.should_quit { break; }
     }
 
     Ok(())

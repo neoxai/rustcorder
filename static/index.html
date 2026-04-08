@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>rustcorder</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #111;
+      color: #ccc;
+      font-family: 'Georgia', serif;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* ── Status bar ───────────────────────────────────── */
+    #status-bar {
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      padding: 6px 14px;
+      background: #1c1c1c;
+      border-bottom: 1px solid #333;
+      font-family: monospace;
+      font-size: 13px;
+      white-space: nowrap;
+      overflow: hidden;
+    }
+
+    #status-bar.recording { background: #3a0000; border-bottom-color: #c00; }
+    #status-bar.punch     { background: #2a1a00; border-bottom-color: #a60; }
+
+    .sb-mode {
+      font-weight: bold;
+      min-width: 130px;
+    }
+    .mode-ready       { color: #4c4; }
+    .mode-recording   { color: #f44; }
+    .mode-precheck    { color: #fa4; }
+    .mode-postrecording { color: #fa4; }
+    .mode-punchrollback { color: #fa4; }
+    .mode-setup       { color: #fa4; }
+    .mode-micerror    { color: #f44; }
+    .mode-fatal       { color: #f44; }
+    .mode-init        { color: #666; }
+
+    .sb-sep { color: #444; }
+
+    .sb-book  { color: #fff; font-weight: bold; }
+    .sb-meta  { color: #aaa; }
+    .sb-time  { color: #88f; font-variant-numeric: tabular-nums; min-width: 72px; }
+
+    .sb-vu-wrap { display: flex; align-items: center; gap: 6px; flex: 1; min-width: 0; }
+    .sb-vu-bar {
+      height: 10px;
+      flex: 1;
+      max-width: 180px;
+      background: #333;
+      border-radius: 2px;
+      overflow: hidden;
+    }
+    .sb-vu-fill {
+      height: 100%;
+      width: 0%;
+      background: #2a2;
+      transition: width 60ms linear;
+    }
+    .sb-vu-fill.yellow { background: #aa4; }
+    .sb-vu-fill.red    { background: #a22; }
+    .sb-db { color: #888; font-size: 11px; min-width: 54px; }
+
+    /* ── EPUB viewer ──────────────────────────────────── */
+    #viewer {
+      flex: 1;
+      min-height: 0;
+      background: #1a1714;
+    }
+
+    /* epub.js injects an iframe; make it fill the container */
+    #viewer iframe {
+      width: 100% !important;
+      height: 100% !important;
+      border: none;
+    }
+
+    /* ── No-epub placeholder ──────────────────────────── */
+    #no-epub {
+      display: none;
+      flex: 1;
+      align-items: center;
+      justify-content: center;
+      flex-direction: column;
+      gap: 10px;
+      color: #555;
+      font-family: monospace;
+    }
+    #no-epub.visible { display: flex; }
+
+    /* ── Connecting overlay ───────────────────────────── */
+    #overlay {
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,0.7);
+      display: flex; align-items: center; justify-content: center;
+      font-family: monospace; font-size: 18px; color: #888;
+      z-index: 100;
+    }
+    #overlay.hidden { display: none; }
+  </style>
+</head>
+<body>
+
+<div id="status-bar">
+  <span class="sb-mode mode-init" id="sb-mode">[ CONNECTING ]</span>
+  <span class="sb-sep">│</span>
+  <span class="sb-book" id="sb-book">—</span>
+  <span class="sb-sep">│</span>
+  <span class="sb-meta" id="sb-meta">Ch — · Part —</span>
+  <span class="sb-sep">│</span>
+  <span class="sb-time"  id="sb-time">—:——:——</span>
+  <span class="sb-sep">│</span>
+  <div class="sb-vu-wrap">
+    <div class="sb-vu-bar"><div class="sb-vu-fill" id="sb-vu-fill"></div></div>
+    <span class="sb-db" id="sb-db">— dBFS</span>
+  </div>
+</div>
+
+<div id="viewer"></div>
+<div id="no-epub"><span>No EPUB loaded</span><span id="no-epub-hint"></span></div>
+<div id="overlay">Connecting to rustcorder…</div>
+
+<script src="https://cdn.jsdelivr.net/npm/epubjs/dist/epub.min.js"></script>
+<script>
+'use strict';
+
+// ── State ──────────────────────────────────────────────────────────────────
+
+let rendition  = null;
+let bookLoaded = false;
+let lastSentCfi   = null;   // CFI we sent to Rust; ignore its echo
+let pendingSeekCfi = null;  // CFI to display once book is ready
+
+// ── WebSocket ──────────────────────────────────────────────────────────────
+
+const overlay = document.getElementById('overlay');
+let ws;
+
+function connect() {
+  ws = new WebSocket(`ws://${location.host}/ws`);
+
+  ws.onopen = () => { overlay.classList.add('hidden'); };
+
+  ws.onmessage = e => {
+    let state;
+    try { state = JSON.parse(e.data); } catch { return; }
+    updateStatusBar(state);
+    handleStateEpub(state);
+  };
+
+  ws.onclose = () => {
+    overlay.classList.remove('hidden');
+    overlay.textContent = 'Disconnected — reconnecting…';
+    setTimeout(connect, 2000);
+  };
+
+  ws.onerror = () => ws.close();
+}
+
+connect();
+
+// ── EPUB loading ───────────────────────────────────────────────────────────
+
+let currentEpubPath = null;
+
+function loadEpub() {
+  const viewer  = document.getElementById('viewer');
+  const noEpub  = document.getElementById('no-epub');
+
+  noEpub.classList.remove('visible');
+  viewer.style.display = 'block';
+
+  const book = ePub('/epub');
+  rendition = book.renderTo('viewer', {
+    flow:   'scrolled-doc',
+    width:  '100%',
+    height: '100%',
+  });
+
+  // Override the iframe background so it matches our dark theme.
+  rendition.themes.override('body', {
+    background: '#1a1714 !important',
+    color:      '#d4cfc8 !important',
+    'font-size': '1.05em',
+    'line-height': '1.7',
+    'max-width': '680px',
+    'margin': '0 auto',
+    'padding': '24px 32px',
+  });
+
+  rendition.display().then(() => {
+    bookLoaded = true;
+    if (pendingSeekCfi) {
+      seekTo(pendingSeekCfi);
+      pendingSeekCfi = null;
+    }
+  }).catch(err => {
+    console.warn('epub display error:', err);
+  });
+
+  // Send position back to Rust when the user scrolls.
+  rendition.on('relocated', location => {
+    const cfi = location?.start?.cfi;
+    if (!cfi) return;
+    lastSentCfi = cfi;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ action: 'epub_seek', cfi }));
+    }
+  });
+}
+
+function handleStateEpub(state) {
+  const viewer = document.getElementById('viewer');
+  const noEpub = document.getElementById('no-epub');
+
+  if (!state.epub_path) {
+    // No epub on this book — show placeholder.
+    viewer.style.display = 'none';
+    noEpub.classList.add('visible');
+    document.getElementById('no-epub-hint').textContent =
+      state.book ? `(add a .epub file to the ${state.book} directory)` : '';
+    rendition = null;
+    bookLoaded = false;
+    currentEpubPath = null;
+    return;
+  }
+
+  // Load or reload the epub when the path changes (book switch).
+  if (state.epub_path !== currentEpubPath) {
+    currentEpubPath = state.epub_path;
+    bookLoaded = false;
+    lastSentCfi = null;
+    if (rendition) { try { rendition.destroy(); } catch {} }
+    viewer.innerHTML = '';
+    loadEpub();
+  }
+
+  // Seek to incoming CFI unless it's our own echo.
+  if (state.epub_cfi && state.epub_cfi !== lastSentCfi) {
+    if (bookLoaded) {
+      seekTo(state.epub_cfi);
+    } else {
+      pendingSeekCfi = state.epub_cfi;
+    }
+  }
+}
+
+function seekTo(cfi) {
+  if (rendition) {
+    rendition.display(cfi).catch(() => {});
+  }
+}
+
+// ── Status bar ─────────────────────────────────────────────────────────────
+
+const MODE_LABELS = {
+  Ready:          '[ READY ]',
+  Recording:      '[ ● RECORDING ]',
+  PreCheck:       '[ CHECKING ]',
+  PostRecording:  '[ STOPPED ]',
+  PunchRollback:  '[ ROLLING BACK ]',
+  Setup:          '[ SETUP ]',
+  MicError:       '[ MIC ERROR ]',
+  Fatal:          '[ FATAL ERROR ]',
+  Init:           '[ CONNECTING ]',
+};
+
+function updateStatusBar(state) {
+  const bar    = document.getElementById('status-bar');
+  const sbMode = document.getElementById('sb-mode');
+  const sbBook = document.getElementById('sb-book');
+  const sbMeta = document.getElementById('sb-meta');
+  const sbTime = document.getElementById('sb-time');
+  const vuFill = document.getElementById('sb-vu-fill');
+  const sbDb   = document.getElementById('sb-db');
+
+  const mode = state.mode || 'Init';
+  sbMode.textContent = MODE_LABELS[mode] || `[ ${mode.toUpperCase()} ]`;
+  sbMode.className = `sb-mode mode-${mode.toLowerCase()}`;
+
+  bar.className = mode === 'Recording' ? 'recording'
+                : (mode === 'PunchRollback' ? 'punch' : '');
+
+  sbBook.textContent = state.book || '—';
+  sbMeta.textContent = `Ch ${String(state.chapter ?? '—').padStart(2,'0')} · Part ${String(state.part ?? '—').padStart(3,'0')}`;
+
+  if (mode === 'Recording') {
+    const s = Math.floor(state.elapsed_secs ?? 0);
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    sbTime.textContent = `${h}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`;
+  } else {
+    sbTime.textContent = '—:——:——';
+  }
+
+  const db = state.rms_dbfs ?? -100;
+  const pct = Math.max(0, Math.min(100, ((db + 60) / 60) * 100));
+  vuFill.style.width = pct + '%';
+  vuFill.className = 'sb-vu-fill' + (db > -6 ? ' red' : db > -18 ? ' yellow' : '');
+  sbDb.textContent = db > -99 ? `${db.toFixed(1)} dB` : '— dBFS';
+}
+</script>
+</body>
+</html>
