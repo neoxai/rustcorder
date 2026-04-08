@@ -24,6 +24,7 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, Terminal};
 
 use app::App;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use web::state::{ActionRx, BrowserState, StateTx, WebAction};
 
 fn main() -> Result<()> {
@@ -102,7 +103,9 @@ fn main() -> Result<()> {
 
 // ── Drain browser actions ─────────────────────────────────────────────────────
 
-fn drain_actions(app: &mut App, action_rx: &ActionRx) {
+/// Drain all pending browser actions.  Returns `true` if any action triggered
+/// a quit (so the caller can break its event loop).
+fn drain_actions(app: &mut App, action_rx: &ActionRx) -> bool {
     while let Ok(action) = action_rx.try_recv() {
         match action {
             WebAction::EpubSeek(cfi) => {
@@ -111,8 +114,30 @@ fn drain_actions(app: &mut App, action_rx: &ActionRx) {
                     let _ = epub.save_position();
                 }
             }
+            WebAction::Key(name) => {
+                // Map action names to the same key codes the TUI uses, then
+                // feed them through the existing state machine via handle_key.
+                let code = match name.as_str() {
+                    "start" | "stop"       => KeyCode::Char(' '),
+                    "punch"                => KeyCode::Char('p'),
+                    "continue_chapter"     => KeyCode::Char('y'),
+                    "chapter_complete"     => KeyCode::Char('n'),
+                    "cancel"               => KeyCode::Esc,
+                    "scroll_forward"       => KeyCode::Right,
+                    "scroll_back"          => KeyCode::Left,
+                    "retry_mic"            => KeyCode::Char('r'),
+                    "edit_session"         => KeyCode::Char('e'),
+                    "quit"                 => KeyCode::Char('q'),
+                    _                      => continue,
+                };
+                let key = KeyEvent::new(code, KeyModifiers::NONE);
+                if app.handle_key(key) {
+                    return true;
+                }
+            }
         }
     }
+    false
 }
 
 // ── Headless loop ─────────────────────────────────────────────────────────────
@@ -133,7 +158,7 @@ fn run_headless(port: u16, state_tx: StateTx, action_rx: ActionRx) -> Result<()>
         }
         if app.should_quit { break; }
 
-        drain_actions(&mut app, &action_rx);
+        if drain_actions(&mut app, &action_rx) { break; }
         app.tick();
         let _ = state_tx.send(BrowserState::from_app(&app));
 
@@ -158,7 +183,7 @@ fn run(state_tx: StateTx, action_rx: ActionRx) -> Result<()> {
 
     loop {
         // ── Drain browser actions ─────────────────────────────────────────
-        drain_actions(&mut app, &action_rx);
+        if drain_actions(&mut app, &action_rx) { break; }
 
         // ── Render ────────────────────────────────────────────────────────
         let epub_pane_width = terminal.size().map(|s| s.width).unwrap_or(80);

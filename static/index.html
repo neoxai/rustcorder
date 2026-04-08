@@ -38,15 +38,15 @@
       font-weight: bold;
       min-width: 130px;
     }
-    .mode-ready       { color: #4c4; }
-    .mode-recording   { color: #f44; }
-    .mode-precheck    { color: #fa4; }
+    .mode-ready         { color: #4c4; }
+    .mode-recording     { color: #f44; }
+    .mode-precheck      { color: #fa4; }
     .mode-postrecording { color: #fa4; }
     .mode-punchrollback { color: #fa4; }
-    .mode-setup       { color: #fa4; }
-    .mode-micerror    { color: #f44; }
-    .mode-fatal       { color: #f44; }
-    .mode-init        { color: #666; }
+    .mode-setup         { color: #fa4; }
+    .mode-micerror      { color: #f44; }
+    .mode-fatal         { color: #f44; }
+    .mode-init          { color: #666; }
 
     .sb-sep { color: #444; }
 
@@ -100,6 +100,21 @@
     }
     #no-epub.visible { display: flex; }
 
+    /* ── Key-hint footer ──────────────────────────────── */
+    #footer {
+      flex-shrink: 0;
+      padding: 3px 14px;
+      background: #161616;
+      border-top: 1px solid #2a2a2a;
+      font-family: monospace;
+      font-size: 11px;
+      color: #555;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      text-align: center;
+    }
+
     /* ── Connecting overlay ───────────────────────────── */
     #overlay {
       position: fixed; inset: 0;
@@ -130,23 +145,32 @@
 
 <div id="viewer"></div>
 <div id="no-epub"><span>No EPUB loaded</span><span id="no-epub-hint"></span></div>
+<div id="footer" id="footer"></div>
 <div id="overlay">Connecting to rustcorder…</div>
 
 <script src="https://cdn.jsdelivr.net/npm/epubjs/dist/epub.min.js"></script>
 <script>
 'use strict';
 
-// ── State ──────────────────────────────────────────────────────────────────
+// ── App state ──────────────────────────────────────────────────────────────
 
-let rendition  = null;
-let bookLoaded = false;
-let lastSentCfi   = null;   // CFI we sent to Rust; ignore its echo
-let pendingSeekCfi = null;  // CFI to display once book is ready
+let currentMode   = 'Init';
+let rendition     = null;
+let bookLoaded    = false;
+let lastSentCfi   = null;    // CFI we sent to Rust; skip its echo
+let pendingSeekCfi = null;   // CFI to display once book is ready
+let currentEpubPath = null;
 
 // ── WebSocket ──────────────────────────────────────────────────────────────
 
 const overlay = document.getElementById('overlay');
 let ws;
+
+function send(obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(obj));
+  }
+}
 
 function connect() {
   ws = new WebSocket(`ws://${location.host}/ws`);
@@ -156,7 +180,9 @@ function connect() {
   ws.onmessage = e => {
     let state;
     try { state = JSON.parse(e.data); } catch { return; }
+    currentMode = state.mode || 'Init';
     updateStatusBar(state);
+    updateFooter(state);
     handleStateEpub(state);
   };
 
@@ -171,13 +197,68 @@ function connect() {
 
 connect();
 
+// ── Keyboard bindings ──────────────────────────────────────────────────────
+//
+// These mirror the TUI key map exactly.  Keys are consumed here and sent as
+// action JSON; the browser's own scroll/etc. behaviour is suppressed.
+
+const ABSORB = new Set(['Space', 'Enter', 'KeyP', 'KeyY', 'KeyN', 'Escape',
+                        'ArrowLeft', 'ArrowRight', 'KeyE', 'KeyR', 'KeyQ']);
+
+document.addEventListener('keydown', e => {
+  // Allow normal input when focus is inside a text field.
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+
+  const key = e.code;
+  if (ABSORB.has(key)) e.preventDefault();
+
+  // ← / → scroll the EPUB in any mode.
+  if (key === 'ArrowRight') { send({ action: 'scroll_forward' }); return; }
+  if (key === 'ArrowLeft')  { send({ action: 'scroll_back'    }); return; }
+
+  switch (currentMode) {
+    case 'Ready':
+      if (key === 'Space' || key === 'Enter') send({ action: 'start' });
+      else if (key === 'KeyE')                send({ action: 'edit_session' });
+      else if (key === 'KeyR')                send({ action: 'retry_mic' });
+      else if (key === 'KeyQ' || key === 'Escape') send({ action: 'quit' });
+      break;
+
+    case 'PreCheck':
+      if (key === 'Escape') send({ action: 'cancel' });
+      break;
+
+    case 'Recording':
+      if (key === 'Space' || key === 'Enter') send({ action: 'stop' });
+      else if (key === 'KeyP')                send({ action: 'punch' });
+      break;
+
+    case 'PostRecording':
+      if (key === 'KeyY' || key === 'Enter') send({ action: 'continue_chapter' });
+      else if (key === 'KeyN')               send({ action: 'chapter_complete' });
+      break;
+
+    case 'PunchRollback':
+      if (key === 'Space' || key === 'Enter') send({ action: 'start' }); // punch in
+      else if (key === 'Escape')              send({ action: 'cancel' });
+      break;
+
+    case 'MicError':
+      if (key === 'KeyR') send({ action: 'retry_mic' });
+      else if (key === 'KeyQ') send({ action: 'quit' });
+      break;
+
+    case 'Fatal':
+      if (key === 'KeyQ' || key === 'Escape') send({ action: 'quit' });
+      break;
+  }
+});
+
 // ── EPUB loading ───────────────────────────────────────────────────────────
 
-let currentEpubPath = null;
-
 function loadEpub() {
-  const viewer  = document.getElementById('viewer');
-  const noEpub  = document.getElementById('no-epub');
+  const viewer = document.getElementById('viewer');
+  const noEpub = document.getElementById('no-epub');
 
   noEpub.classList.remove('visible');
   viewer.style.display = 'block';
@@ -189,15 +270,14 @@ function loadEpub() {
     height: '100%',
   });
 
-  // Override the iframe background so it matches our dark theme.
   rendition.themes.override('body', {
-    background: '#1a1714 !important',
-    color:      '#d4cfc8 !important',
-    'font-size': '1.05em',
-    'line-height': '1.7',
-    'max-width': '680px',
-    'margin': '0 auto',
-    'padding': '24px 32px',
+    background:   '#1a1714 !important',
+    color:        '#d4cfc8 !important',
+    'font-size':  '1.05em',
+    'line-height':'1.7',
+    'max-width':  '680px',
+    'margin':     '0 auto',
+    'padding':    '24px 32px',
   });
 
   rendition.display().then(() => {
@@ -206,18 +286,17 @@ function loadEpub() {
       seekTo(pendingSeekCfi);
       pendingSeekCfi = null;
     }
-  }).catch(err => {
-    console.warn('epub display error:', err);
-  });
+  }).catch(err => console.warn('epub display error:', err));
+
+  // Forward keyboard events from inside the epub.js iframe to our handler.
+  rendition.on('keydown', e => document.dispatchEvent(new KeyboardEvent('keydown', e)));
 
   // Send position back to Rust when the user scrolls.
   rendition.on('relocated', location => {
     const cfi = location?.start?.cfi;
     if (!cfi) return;
     lastSentCfi = cfi;
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ action: 'epub_seek', cfi }));
-    }
+    send({ action: 'epub_seek', cfi });
   });
 }
 
@@ -226,18 +305,17 @@ function handleStateEpub(state) {
   const noEpub = document.getElementById('no-epub');
 
   if (!state.epub_path) {
-    // No epub on this book — show placeholder.
     viewer.style.display = 'none';
     noEpub.classList.add('visible');
     document.getElementById('no-epub-hint').textContent =
-      state.book ? `(add a .epub file to the ${state.book} directory)` : '';
+      state.book ? `(add a .epub file to the ${state.book}/ directory)` : '';
     rendition = null;
     bookLoaded = false;
     currentEpubPath = null;
     return;
   }
 
-  // Load or reload the epub when the path changes (book switch).
+  // Reload when the book changes.
   if (state.epub_path !== currentEpubPath) {
     currentEpubPath = state.epub_path;
     bookLoaded = false;
@@ -247,7 +325,7 @@ function handleStateEpub(state) {
     loadEpub();
   }
 
-  // Seek to incoming CFI unless it's our own echo.
+  // Seek unless it's our own echo.
   if (state.epub_cfi && state.epub_cfi !== lastSentCfi) {
     if (bookLoaded) {
       seekTo(state.epub_cfi);
@@ -258,9 +336,7 @@ function handleStateEpub(state) {
 }
 
 function seekTo(cfi) {
-  if (rendition) {
-    rendition.display(cfi).catch(() => {});
-  }
+  if (rendition) rendition.display(cfi).catch(() => {});
 }
 
 // ── Status bar ─────────────────────────────────────────────────────────────
@@ -288,29 +364,35 @@ function updateStatusBar(state) {
 
   const mode = state.mode || 'Init';
   sbMode.textContent = MODE_LABELS[mode] || `[ ${mode.toUpperCase()} ]`;
-  sbMode.className = `sb-mode mode-${mode.toLowerCase()}`;
+  sbMode.className   = `sb-mode mode-${mode.toLowerCase()}`;
 
-  bar.className = mode === 'Recording' ? 'recording'
-                : (mode === 'PunchRollback' ? 'punch' : '');
+  bar.className = mode === 'Recording'     ? 'recording'
+                : mode === 'PunchRollback' ? 'punch' : '';
 
   sbBook.textContent = state.book || '—';
   sbMeta.textContent = `Ch ${String(state.chapter ?? '—').padStart(2,'0')} · Part ${String(state.part ?? '—').padStart(3,'0')}`;
 
   if (mode === 'Recording') {
-    const s = Math.floor(state.elapsed_secs ?? 0);
-    const h = Math.floor(s / 3600);
-    const m = Math.floor((s % 3600) / 60);
+    const s   = Math.floor(state.elapsed_secs ?? 0);
+    const h   = Math.floor(s / 3600);
+    const m   = Math.floor((s % 3600) / 60);
     const sec = s % 60;
     sbTime.textContent = `${h}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`;
   } else {
     sbTime.textContent = '—:——:——';
   }
 
-  const db = state.rms_dbfs ?? -100;
+  const db  = state.rms_dbfs ?? -100;
   const pct = Math.max(0, Math.min(100, ((db + 60) / 60) * 100));
   vuFill.style.width = pct + '%';
-  vuFill.className = 'sb-vu-fill' + (db > -6 ? ' red' : db > -18 ? ' yellow' : '');
-  sbDb.textContent = db > -99 ? `${db.toFixed(1)} dB` : '— dBFS';
+  vuFill.className   = 'sb-vu-fill' + (db > -6 ? ' red' : db > -18 ? ' yellow' : '');
+  sbDb.textContent   = db > -99 ? `${db.toFixed(1)} dB` : '— dBFS';
+}
+
+// ── Footer hint bar ────────────────────────────────────────────────────────
+
+function updateFooter(state) {
+  document.getElementById('footer').textContent = state.footer_hints || '';
 }
 </script>
 </body>

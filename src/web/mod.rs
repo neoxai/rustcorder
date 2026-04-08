@@ -158,15 +158,13 @@ async fn handle_socket(mut socket: WebSocket, ss: Arc<ServerState>) {
     }
 
     loop {
+        // `biased` checks branches in declaration order.
+        // socket.recv() is first so incoming browser messages are never
+        // starved by the high-frequency state broadcasts (~25 Hz).
         tokio::select! {
-            // New state snapshot available — push to client.
-            result = rx.changed() => {
-                if result.is_err() { break; }
-                let json = serde_json::to_string(&*rx.borrow()).unwrap_or_default();
-                if socket.send(Message::Text(json)).await.is_err() { break; }
-            }
+            biased;
 
-            // Incoming message from browser.
+            // Incoming message from browser (highest priority).
             msg = socket.recv() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
@@ -175,6 +173,13 @@ async fn handle_socket(mut socket: WebSocket, ss: Arc<ServerState>) {
                     Some(Ok(Message::Close(_))) | None => break,
                     _ => {}
                 }
+            }
+
+            // New state snapshot available — push to client.
+            result = rx.changed() => {
+                if result.is_err() { break; }
+                let json = serde_json::to_string(&*rx.borrow()).unwrap_or_default();
+                if socket.send(Message::Text(json)).await.is_err() { break; }
             }
         }
     }
@@ -192,6 +197,18 @@ fn handle_browser_message(text: &str, action_tx: &ActionTx) {
                 let _ = action_tx.try_send(WebAction::EpubSeek(cfi));
             }
         }
-        _ => {} // unknown actions ignored; Phase 4 adds more
+        // Recorder key actions — forwarded as WebAction::Key and converted to
+        // synthetic KeyEvents in drain_actions.
+        Some(name @ (
+            "start" | "stop" |
+            "punch" |
+            "continue_chapter" | "chapter_complete" |
+            "cancel" |
+            "scroll_forward" | "scroll_back" |
+            "retry_mic" | "edit_session" | "quit"
+        )) => {
+            let _ = action_tx.try_send(WebAction::Key(name.to_string()));
+        }
+        _ => {}
     }
 }

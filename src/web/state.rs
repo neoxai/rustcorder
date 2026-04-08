@@ -120,6 +120,11 @@ impl BrowserState {
 pub enum WebAction {
     /// User scrolled the epub.js rendition; update the Rust position.
     EpubSeek(crate::epub::EpubCfi),
+    /// A recorder key action sent from the browser keyboard.
+    /// The string matches the `action` field in the browser JSON message,
+    /// e.g. `"start"`, `"punch"`, `"cancel"`.  Converted to a synthetic
+    /// `KeyEvent` in `drain_actions` and fed through `app.handle_key()`.
+    Key(String),
 }
 
 /// Sender half — held by each WebSocket connection handler.
