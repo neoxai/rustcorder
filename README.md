@@ -95,6 +95,7 @@ Copy `.env` into the directory you run the binary from (it is already present in
 | Recording | `Space` / `Enter` | Stop recording |
 | Recording | `P` | **Punch and roll** — stop, rewind, play back |
 | Rollback | `Space` / `Enter` | **Punch in** — mark this moment as the new start |
+| Rollback | `P` | Rewind another `PUNCH_BACK_TIME` seconds and restart playback |
 | Rollback | `Esc` | Cancel punch, return to post-recording prompt |
 | Post-recording | `Y` / `Enter` | Continue chapter (increment part) |
 | Post-recording | `N` | Chapter complete (advance chapter, reset part) |
@@ -152,9 +153,10 @@ Punch-and-roll is a professional narration technique for correcting mistakes mid
 1. While **Recording**, press **`P`**
 2. The current clip is finalized immediately
 3. Playback rewinds `PUNCH_BACK_TIME` seconds from the end and plays through your speakers
-4. When you hear the point you want to re-record from, press **`Space`**
-5. Playback stops; the elapsed time is used to compute the exact punch-in position
-6. A signal check runs, then recording begins as a new part file, starting at the punch-in timestamp in the timeline
+4. If the rewind didn't go back far enough, press **`P`** again — each press rewinds another `PUNCH_BACK_TIME` seconds. Playback restarts from the new position. Rewinding past the chapter start clamps to the beginning of the chapter.
+5. When you hear the point you want to re-record from, press **`Space`**
+6. Playback stops; the elapsed time is used to compute the exact punch-in position
+7. A signal check runs, then recording begins as a new part file, starting at the punch-in timestamp in the timeline
 
 The old clip file is never modified. The timeline index records the punch-in point so that the new clip supersedes the old one from that moment forward.
 

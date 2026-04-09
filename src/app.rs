@@ -412,6 +412,7 @@ impl App {
     fn handle_key_punch_rollback(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char(' ') | KeyCode::Enter => self.punch_in(),
+            KeyCode::Char('p') | KeyCode::Char('P') => self.rewind_punch_rollback(),
             KeyCode::Esc | KeyCode::Char('q') => self.abort_punch_rollback(),
             _ => {}
         }
@@ -630,6 +631,12 @@ impl App {
         let clip_end = self.clip_start_timeline + duration;
         self.punch_rollback_abs = (clip_end - self.punch_back_time).max(0.0);
 
+        self.start_punch_playback();
+    }
+
+    /// Restart rollback playback from `self.punch_rollback_abs`.  Shared by
+    /// `begin_punch` (initial punch) and `rewind_punch_rollback` (re-press P).
+    fn start_punch_playback(&mut self) {
         let path = match &self.active_file {
             Some(p) => p.clone(),
             None => {
@@ -699,6 +706,18 @@ impl App {
                 self.mode = AppMode::Fatal;
             }
         }
+    }
+
+    /// Called when P is pressed during PunchRollback.  Moves the rollback
+    /// start back another punch_back_time seconds (floored at chapter start,
+    /// i.e. 0.0) and restarts playback from there.
+    fn rewind_punch_rollback(&mut self) {
+        // Stop current playback before restarting.
+        if let Some(h) = self.playback.take() {
+            h.stop();
+        }
+        self.punch_rollback_abs = (self.punch_rollback_abs - self.punch_back_time).max(0.0);
+        self.start_punch_playback();
     }
 
     /// Called when Space is pressed during PunchRollback.  Stops playback,
