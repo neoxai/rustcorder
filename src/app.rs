@@ -131,6 +131,9 @@ pub struct App {
     pub epub_autosave_accum: f64,
     /// Last known pane width used for wrapping; triggers rewrap on change.
     pub epub_pane_width: u16,
+    /// Last raw CFI string received from the browser (epub.js format).
+    /// Stored verbatim and echoed back so epub.js can resolve it correctly.
+    pub epub_raw_cfi: Option<String>,
 
     // ── Quit flag ─────────────────────────────────────────────────────────
     pub should_quit: bool,
@@ -236,6 +239,7 @@ impl App {
             epub_autoscroll_accum: 0.0,
             epub_autosave_accum: 0.0,
             epub_pane_width: 0,
+            epub_raw_cfi: None,
             should_quit: false,
         }
     }

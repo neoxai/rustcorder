@@ -1,0 +1,3 @@
+# rustcorder timeline — MouseAndMotorcycle / Chapter 02
+CLIP Chapter_02_part001.wav START=0.000
+CLIP Chapter_02_part002.wav START=5.589

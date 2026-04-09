@@ -87,6 +87,8 @@ fn main() -> Result<()> {
     {
         let _ = std::process::Command::new("xdg-open")
             .arg(format!("http://localhost:{web_port}/"))
+            .stderr(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
             .spawn();
     }
 
@@ -118,11 +120,14 @@ fn main() -> Result<()> {
 fn drain_actions(app: &mut App, action_rx: &ActionRx) -> bool {
     while let Ok(action) = action_rx.try_recv() {
         match action {
-            WebAction::EpubSeek(cfi) => {
+            WebAction::EpubSeek(raw_cfi) => {
                 if let Some(ref mut epub) = app.epub {
-                    epub.seek_to_cfi(cfi);
-                    let _ = epub.save_position();
+                    if let Some(cfi) = crate::epub::EpubCfi::parse(&raw_cfi) {
+                        epub.seek_to_cfi(cfi);
+                        let _ = epub.save_position();
+                    }
                 }
+                app.epub_raw_cfi = Some(raw_cfi);
             }
             WebAction::Key(name) => {
                 // Map action names to the same key codes the TUI uses, then

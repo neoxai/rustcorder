@@ -119,11 +119,11 @@
     #overlay {
       position: fixed; inset: 0;
       background: rgba(0,0,0,0.7);
-      display: flex; align-items: center; justify-content: center;
+      display: none; align-items: center; justify-content: center;
       font-family: monospace; font-size: 18px; color: #888;
       z-index: 100;
     }
-    #overlay.hidden { display: none; }
+    #overlay.visible { display: flex; }
   </style>
 </head>
 <body>
@@ -146,7 +146,7 @@
 <div id="viewer"></div>
 <div id="no-epub"><span>No EPUB loaded</span><span id="no-epub-hint"></span></div>
 <div id="footer" id="footer"></div>
-<div id="overlay">Connecting to rustcorder…</div>
+<div id="overlay">Disconnected — reconnecting…</div>
 
 <script src="/jszip.min.js"></script>
 <script src="/epub.min.js"></script>
@@ -176,7 +176,7 @@ function send(obj) {
 function connect() {
   ws = new WebSocket(`ws://${location.host}/ws`);
 
-  ws.onopen = () => { overlay.classList.add('hidden'); };
+  ws.onopen = () => { overlay.classList.remove('visible'); };
 
   ws.onmessage = e => {
     let state;
@@ -188,7 +188,7 @@ function connect() {
   };
 
   ws.onclose = () => {
-    overlay.classList.remove('hidden');
+    overlay.classList.add('visible');
     overlay.textContent = 'Disconnected — reconnecting…';
     setTimeout(connect, 2000);
   };
@@ -220,9 +220,10 @@ document.addEventListener('keydown', e => {
   const key = e.code;
   if (ABSORB.has(key)) e.preventDefault();
 
-  // ← / → scroll the EPUB in any mode.
-  if (key === 'ArrowRight') { send({ action: 'scroll_forward' }); return; }
-  if (key === 'ArrowLeft')  { send({ action: 'scroll_back'    }); return; }
+  // ← / → scroll the EPUB directly in the browser; position syncs back to
+  // Rust via the relocated event, so no round-trip needed.
+  if (key === 'ArrowRight') { if (rendition) rendition.next(); return; }
+  if (key === 'ArrowLeft')  { if (rendition) rendition.prev(); return; }
 
   switch (currentMode) {
     case 'Ready':
@@ -271,30 +272,36 @@ function loadEpub() {
   noEpub.classList.remove('visible');
   viewer.style.display = 'block';
 
-  fetch('/epub')
-    .then(r => r.arrayBuffer())
-    .then(buf => loadEpubFromBuffer(buf))
-    .catch(err => console.warn('epub fetch error:', err));
-}
-
-function loadEpubFromBuffer(buf) {
-  const viewer = document.getElementById('viewer');
-
-  const book = ePub(buf);
+  const book = ePub('/book/');
   rendition = book.renderTo('viewer', {
-    flow:   'scrolled-doc',
+    flow:   'scrolled',
     width:  '100%',
     height: '100%',
   });
 
-  rendition.themes.override('body', {
-    background:   '#1a1714 !important',
-    color:        '#d4cfc8 !important',
-    'font-size':  '1.05em',
-    'line-height':'1.7',
-    'max-width':  '680px',
-    'margin':     '0 auto',
-    'padding':    '24px 32px',
+  rendition.hooks.content.register(contents => {
+    contents.addStylesheetCss(`
+      body {
+        background: #1a1714 !important;
+        color: #d4cfc8 !important;
+        font-size: 1.05em;
+        line-height: 1.7;
+        max-width: 680px;
+        margin: 0 auto;
+        padding: 24px 32px;
+      }
+    `);
+    // Forward keydown events from inside the iframe to the parent document.
+    // Arrow keys are handled here directly to avoid the iframe's native scroll
+    // fighting with rendition.next()/prev().
+    contents.document.addEventListener('keydown', e => {
+      if (e.code === 'ArrowRight') { e.preventDefault(); if (rendition) rendition.next(); return; }
+      if (e.code === 'ArrowLeft')  { e.preventDefault(); if (rendition) rendition.prev(); return; }
+      document.dispatchEvent(new KeyboardEvent('keydown', {
+        code: e.code, key: e.key, bubbles: true,
+        shiftKey: e.shiftKey, ctrlKey: e.ctrlKey, altKey: e.altKey,
+      }));
+    });
   });
 
   rendition.display().then(() => {
@@ -304,9 +311,6 @@ function loadEpubFromBuffer(buf) {
       pendingSeekCfi = null;
     }
   }).catch(err => console.warn('epub display error:', err));
-
-  // Forward keyboard events from inside the epub.js iframe to our handler.
-  rendition.on('keydown', e => document.dispatchEvent(new KeyboardEvent('keydown', e)));
 
   // Send position back to Rust when the user scrolls.
   rendition.on('relocated', location => {

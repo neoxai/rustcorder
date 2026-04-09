@@ -71,7 +71,7 @@ impl BrowserState {
             .map(|s| s.elapsed().as_secs_f64())
             .unwrap_or(0.0);
 
-        let epub_cfi = app.epub.as_ref().map(|e| e.cfi.to_cfi_string());
+        let epub_cfi = app.epub_raw_cfi.clone();
 
         // Build the epub filesystem path from session dir + epub filename.
         let epub_path = app.epub.as_ref().map(|e| {
@@ -119,7 +119,8 @@ impl BrowserState {
 /// Actions the browser can send back to the main app loop.
 pub enum WebAction {
     /// User scrolled the epub.js rendition; update the Rust position.
-    EpubSeek(crate::epub::EpubCfi),
+    /// Carries the raw CFI string from epub.js, preserved verbatim.
+    EpubSeek(String),
     /// A recorder key action sent from the browser keyboard.
     /// The string matches the `action` field in the browser JSON message,
     /// e.g. `"start"`, `"punch"`, `"cancel"`.  Converted to a synthetic
