@@ -1,2 +1,2 @@
 EPUB=Beverly Cleary - Ralph 1 - The Mouse and the Motorcycle.epub
-CFI=epubcfi(/6/8!/1:0)
+CFI=epubcfi(/6/4!/1:0)
