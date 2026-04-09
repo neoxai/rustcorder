@@ -32,27 +32,26 @@
     }
 
     #status-bar.recording { background: #3a0000; border-bottom-color: #c00; }
-    #status-bar.punch     { background: #2a1a00; border-bottom-color: #a60; }
+    #status-bar.playing   { background: #002200; border-bottom-color: #060; }
+    #status-bar.standby   { background: #1c1400; border-bottom-color: #550; }
 
     .sb-mode {
       font-weight: bold;
       min-width: 130px;
     }
-    .mode-ready         { color: #4c4; }
-    .mode-recording     { color: #f44; }
-    .mode-precheck      { color: #fa4; }
-    .mode-postrecording { color: #fa4; }
-    .mode-punchrollback { color: #fa4; }
-    .mode-setup         { color: #fa4; }
-    .mode-micerror      { color: #f44; }
-    .mode-fatal         { color: #f44; }
-    .mode-init          { color: #666; }
+    .mode-standby   { color: #cc0; }
+    .mode-playing   { color: #4c4; }
+    .mode-recording { color: #f44; }
+    .mode-setup     { color: #fa4; }
+    .mode-micerror  { color: #f44; }
+    .mode-fatal     { color: #f44; }
+    .mode-init      { color: #666; }
 
     .sb-sep { color: #444; }
 
     .sb-book  { color: #fff; font-weight: bold; }
     .sb-meta  { color: #aaa; }
-    .sb-time  { color: #88f; font-variant-numeric: tabular-nums; min-width: 72px; }
+    .sb-time  { color: #88f; font-variant-numeric: tabular-nums; min-width: 80px; }
 
     .sb-vu-wrap { display: flex; align-items: center; gap: 6px; flex: 1; min-width: 0; }
     .sb-vu-bar {
@@ -208,8 +207,9 @@ connect();
 // These mirror the TUI key map exactly.  Keys are consumed here and sent as
 // action JSON; the browser's own scroll/etc. behaviour is suppressed.
 
-const ABSORB = new Set(['Space', 'Enter', 'KeyP', 'KeyY', 'KeyN', 'Escape',
-                        'ArrowLeft', 'ArrowRight', 'KeyE', 'KeyR', 'KeyQ']);
+const ABSORB = new Set(['Space', 'Enter', 'KeyP', 'KeyJ', 'KeyK', 'KeyL',
+                        'KeyN', 'Escape', 'ArrowLeft', 'ArrowRight',
+                        'KeyE', 'KeyR', 'KeyQ']);
 
 document.addEventListener('keydown', e => {
   // Allow normal input when focus is inside a text field.
@@ -218,36 +218,33 @@ document.addEventListener('keydown', e => {
   const key = e.code;
   if (ABSORB.has(key)) e.preventDefault();
 
-  // ← / → scroll the EPUB directly in the browser; position is saved to
-  // localStorage via the relocated event.
+  // ← / → scroll the EPUB directly in the browser.
   if (key === 'ArrowRight') { if (rendition) rendition.next(); return; }
   if (key === 'ArrowLeft')  { if (rendition) rendition.prev(); return; }
 
   switch (currentMode) {
-    case 'Ready':
-      if (key === 'Space' || key === 'Enter') send({ action: 'start' });
-      else if (key === 'KeyE')                send({ action: 'edit_session' });
-      else if (key === 'KeyR')                send({ action: 'retry_mic' });
+    case 'Standby':
+      if (key === 'Space' || key === 'Enter')      send({ action: 'start' });
+      else if (key === 'KeyL')                     send({ action: 'play' });
+      else if (key === 'KeyJ')                     send({ action: 'jump_back' });
+      else if (key === 'KeyK')                     send({ action: 'jump_forward' });
+      else if (key === 'KeyN')                     send({ action: 'next_chapter' });
+      else if (key === 'KeyE')                     send({ action: 'edit_session' });
+      else if (key === 'KeyR')                     send({ action: 'retry_mic' });
       else if (key === 'KeyQ' || key === 'Escape') send({ action: 'quit' });
       break;
 
-    case 'PreCheck':
-      if (key === 'Escape') send({ action: 'cancel' });
+    case 'Playing':
+      if (key === 'Space' || key === 'Enter') send({ action: 'start' }); // punch in
+      else if (key === 'KeyL')                send({ action: 'pause' });
+      else if (key === 'KeyP')                send({ action: 'punch' });
+      else if (key === 'KeyJ')                send({ action: 'jump_back' });
+      else if (key === 'KeyK')                send({ action: 'jump_forward' });
       break;
 
     case 'Recording':
       if (key === 'Space' || key === 'Enter') send({ action: 'stop' });
       else if (key === 'KeyP')                send({ action: 'punch' });
-      break;
-
-    case 'PostRecording':
-      if (key === 'KeyY' || key === 'Enter') send({ action: 'continue_chapter' });
-      else if (key === 'KeyN')               send({ action: 'chapter_complete' });
-      break;
-
-    case 'PunchRollback':
-      if (key === 'Space' || key === 'Enter') send({ action: 'start' }); // punch in
-      else if (key === 'Escape')              send({ action: 'cancel' });
       break;
 
     case 'MicError':
@@ -342,18 +339,25 @@ function handleStateEpub(state) {
 }
 
 
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+function fmtMmSs(secs) {
+  const total = Math.max(0, secs);
+  const m   = Math.floor(total / 60);
+  const s   = (total % 60).toFixed(1).padStart(4, '0');
+  return `${String(m).padStart(2,'0')}:${s}`;
+}
+
 // ── Status bar ─────────────────────────────────────────────────────────────
 
 const MODE_LABELS = {
-  Ready:          '[ READY ]',
-  Recording:      '[ ● RECORDING ]',
-  PreCheck:       '[ CHECKING ]',
-  PostRecording:  '[ STOPPED ]',
-  PunchRollback:  '[ ROLLING BACK ]',
-  Setup:          '[ SETUP ]',
-  MicError:       '[ MIC ERROR ]',
-  Fatal:          '[ FATAL ERROR ]',
-  Init:           '[ CONNECTING ]',
+  Standby:   '[ STANDBY ]',
+  Playing:   '[ ▶ PLAYING ]',
+  Recording: '[ ● RECORDING ]',
+  Setup:     '[ SETUP ]',
+  MicError:  '[ MIC ERROR ]',
+  Fatal:     '[ FATAL ERROR ]',
+  Init:      '[ CONNECTING ]',
 };
 
 function updateStatusBar(state) {
@@ -369,21 +373,16 @@ function updateStatusBar(state) {
   sbMode.textContent = MODE_LABELS[mode] || `[ ${mode.toUpperCase()} ]`;
   sbMode.className   = `sb-mode mode-${mode.toLowerCase()}`;
 
-  bar.className = mode === 'Recording'     ? 'recording'
-                : mode === 'PunchRollback' ? 'punch' : '';
+  bar.className = mode === 'Recording' ? 'recording'
+                : mode === 'Playing'   ? 'playing'
+                : mode === 'Standby'   ? 'standby' : '';
 
   sbBook.textContent = state.book || '—';
   sbMeta.textContent = `Ch ${String(state.chapter ?? '—').padStart(2,'0')} · Part ${String(state.part ?? '—').padStart(3,'0')}`;
 
-  if (mode === 'Recording') {
-    const s   = Math.floor(state.elapsed_secs ?? 0);
-    const h   = Math.floor(s / 3600);
-    const m   = Math.floor((s % 3600) / 60);
-    const sec = s % 60;
-    sbTime.textContent = `${h}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`;
-  } else {
-    sbTime.textContent = '—:——:——';
-  }
+  // Timeline position — always shown, live during Playing.
+  const posSecs = state.timeline_pos_secs ?? 0;
+  sbTime.textContent = fmtMmSs(posSecs);
 
   const db  = state.rms_dbfs ?? -100;
   const pct = Math.max(0, Math.min(100, ((db + 60) / 60) * 100));

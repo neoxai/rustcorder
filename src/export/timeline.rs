@@ -285,6 +285,7 @@ pub struct PunchSegment {
 /// `current_start`   — timeline position where the just-recorded clip began.
 /// `current_file`    — path to the just-recorded clip.
 /// `discard_short` / `discard_secs` — mirror the DISCARD_SHORT_CLIPS settings.
+#[allow(dead_code)]
 pub fn punch_rollback_segments(
     timeline_path: &Path,
     book_dir: &Path,
@@ -349,6 +350,174 @@ pub fn punch_rollback_segments(
     });
 
     Ok(segments)
+}
+
+// ── General-purpose timeline playback segments ───────────────────────────────
+
+/// Build ordered playback segments covering `[start_pos, end-of-chapter]`
+/// using "last recorded wins" semantics.
+///
+/// Unlike `punch_rollback_segments`, this function has no concept of a
+/// "current clip" — it works entirely from the timeline file and is used for
+/// Standby → Playing (L) and J/K navigation during playback.
+pub fn timeline_segments_from(
+    timeline_path: &Path,
+    book_dir: &Path,
+    start_pos: f64,
+) -> Result<Vec<PunchSegment>> {
+    let entries = parse_timeline(timeline_path)?;
+    let n = entries.len();
+    let mut segments = Vec::new();
+
+    for i in 0..n {
+        let entry = &entries[i];
+        let path = book_dir.join(&entry.filename);
+
+        let total_samples = match wav_sample_count(&path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let total_secs = total_samples as f64 / SAMPLE_RATE as f64;
+
+        let effective_end = if i + 1 < n {
+            (entry.start + total_secs).min(entries[i + 1].start)
+        } else {
+            entry.start + total_secs
+        };
+
+        if effective_end <= entry.start {
+            continue; // completely superseded
+        }
+
+        let overlap_start = start_pos.max(entry.start);
+        if overlap_start >= effective_end {
+            continue; // entirely before start_pos
+        }
+
+        segments.push(PunchSegment {
+            path,
+            file_offset_secs: overlap_start - entry.start,
+            play_secs: effective_end - overlap_start,
+        });
+    }
+
+    // The last segment should play to EOF so we don't cut off at an
+    // effective_end boundary that may be slightly off due to floating-point.
+    if let Some(last) = segments.last_mut() {
+        last.play_secs = f64::INFINITY;
+    }
+
+    Ok(segments)
+}
+
+/// Return the absolute timeline start of the canonical clip that "owns"
+/// position `pos`.  If `pos` is beyond all clips, returns the last clip start.
+/// Returns 0.0 if the timeline is empty or unreadable.
+pub fn current_part_start(
+    timeline_path: &Path,
+    book_dir: &Path,
+    pos: f64,
+) -> Result<f64> {
+    let entries = parse_timeline(timeline_path)?;
+    let n = entries.len();
+    if n == 0 {
+        return Ok(0.0);
+    }
+
+    let mut result = entries[0].start;
+
+    for i in 0..n {
+        let entry = &entries[i];
+        if entry.start > pos {
+            break;
+        }
+        let path = book_dir.join(&entry.filename);
+        let total_secs = wav_sample_count(&path).unwrap_or(0) as f64 / SAMPLE_RATE as f64;
+        let effective_end = if i + 1 < n {
+            (entry.start + total_secs).min(entries[i + 1].start)
+        } else {
+            entry.start + total_secs
+        };
+        if effective_end <= entry.start {
+            continue; // superseded
+        }
+        if pos < effective_end || i == n - 1 {
+            result = entry.start;
+        }
+    }
+
+    Ok(result)
+}
+
+/// Return the absolute timeline start of the next canonical clip after `pos`,
+/// or `None` if `pos` is already within the last clip.
+pub fn next_part_start(
+    timeline_path: &Path,
+    book_dir: &Path,
+    pos: f64,
+) -> Result<Option<f64>> {
+    let entries = parse_timeline(timeline_path)?;
+    let n = entries.len();
+    if n == 0 {
+        return Ok(None);
+    }
+
+    // Find the index of the clip that owns pos.
+    let mut current_idx = 0usize;
+    for i in 0..n {
+        let entry = &entries[i];
+        if entry.start > pos {
+            break;
+        }
+        let path = book_dir.join(&entry.filename);
+        let total_secs = wav_sample_count(&path).unwrap_or(0) as f64 / SAMPLE_RATE as f64;
+        let effective_end = if i + 1 < n {
+            (entry.start + total_secs).min(entries[i + 1].start)
+        } else {
+            entry.start + total_secs
+        };
+        if effective_end <= entry.start {
+            continue;
+        }
+        if pos < effective_end || i == n - 1 {
+            current_idx = i;
+        }
+    }
+
+    // Find the next non-superseded entry after current_idx.
+    for i in (current_idx + 1)..n {
+        let entry = &entries[i];
+        let path = book_dir.join(&entry.filename);
+        let total_secs = wav_sample_count(&path).unwrap_or(0) as f64 / SAMPLE_RATE as f64;
+        let effective_end = if i + 1 < n {
+            (entry.start + total_secs).min(entries[i + 1].start)
+        } else {
+            entry.start + total_secs
+        };
+        if effective_end > entry.start {
+            return Ok(Some(entry.start));
+        }
+    }
+
+    Ok(None) // pos is in the last canonical clip
+}
+
+/// Return the absolute end of all recorded audio for a chapter
+/// (last timeline entry's start + its WAV duration).
+pub fn chapter_end(
+    timeline_path: &Path,
+    book_dir: &Path,
+) -> Result<f64> {
+    let entries = parse_timeline(timeline_path)?;
+    match entries.last() {
+        None => Ok(0.0),
+        Some(last) => {
+            let path = book_dir.join(&last.filename);
+            let total_secs = wav_sample_count(&path)
+                .unwrap_or(0) as f64 / SAMPLE_RATE as f64;
+            Ok(last.start + total_secs)
+        }
+    }
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────

@@ -10,7 +10,7 @@ use crate::app::{App, AppMode};
 /// browser clients via WebSocket and served at `GET /state`.
 #[derive(Clone, Debug, Serialize)]
 pub struct BrowserState {
-    /// Current recorder mode, e.g. `"Recording"`, `"Ready"`.
+    /// Current recorder mode: `"Standby"`, `"Playing"`, `"Recording"`, etc.
     pub mode: String,
     pub book: String,
     pub chapter: u32,
@@ -22,10 +22,10 @@ pub struct BrowserState {
     /// True when the silence watchdog has fired (>15 s of silence while recording).
     pub silence_warning: bool,
     /// Absolute filesystem path to the `.epub` file served by `GET /epub`.
-    /// `null` when no EPUB is loaded.  Not shown in the browser UI; used
-    /// internally by the `/epub` endpoint.
+    /// `null` when no EPUB is loaded.
     pub epub_path: Option<String>,
     /// Absolute timeline position in seconds for the current chapter.
+    /// During Playing this is the live playhead; otherwise it is the cursor.
     pub timeline_pos_secs: f64,
     /// Key-hint string matching the TUI footer for the current mode.
     pub footer_hints: String,
@@ -52,14 +52,12 @@ impl BrowserState {
     /// Build a snapshot from the current `App`.  Called on every tick.
     pub fn from_app(app: &App) -> Self {
         let mode = match app.mode {
-            AppMode::Setup => "Setup",
-            AppMode::Ready => "Ready",
-            AppMode::PreCheck => "PreCheck",
-            AppMode::Recording => "Recording",
-            AppMode::PostRecording => "PostRecording",
-            AppMode::PunchRollback => "PunchRollback",
-            AppMode::MicError => "MicError",
-            AppMode::Fatal => "Fatal",
+            AppMode::Setup      => "Setup",
+            AppMode::Standby    => "Standby",
+            AppMode::Playing    => "Playing",
+            AppMode::Recording  => "Recording",
+            AppMode::MicError   => "MicError",
+            AppMode::Fatal      => "Fatal",
         }
         .to_string();
 
@@ -70,15 +68,16 @@ impl BrowserState {
 
         let epub_path = app.epub_path.as_ref().map(|p| p.to_string_lossy().into_owned());
 
+        // Live playhead during Playing; cursor position otherwise.
+        let timeline_pos_secs = app.playhead_pos();
+
         let footer_hints = match app.mode {
-            AppMode::Setup => "[Enter] Confirm   [Tab] Switch field   [Esc] Cancel",
-            AppMode::Ready => "[Space] Start   [E] Edit session   [R] Re-detect mic   [Q] Quit",
-            AppMode::PreCheck => "[Esc] Abort check",
-            AppMode::Recording => "[Space] Stop   [P] Punch and roll",
-            AppMode::PostRecording => "[Y/Enter] Continue chapter   [N] Chapter complete",
-            AppMode::PunchRollback => "[Space] Punch in here   [Esc] Cancel",
-            AppMode::MicError => "[R] Retry detection   [Q] Quit",
-            AppMode::Fatal => "[Q] Quit",
+            AppMode::Setup     => "[Enter] Confirm   [Tab] Switch field   [Esc] Cancel",
+            AppMode::Standby   => "[Space] Record   [L] Play   [J] ◀ Part   [K] Part ▶   [N] Next chapter   [E] Edit   [Q] Quit",
+            AppMode::Playing   => "[Space] Punch in   [L] Pause   [J] ◀ Part   [K] Part ▶   [P] Rewind",
+            AppMode::Recording => "[Space] Stop   [P] Punch back",
+            AppMode::MicError  => "[R] Retry detection   [Q] Quit",
+            AppMode::Fatal     => "[Q] Quit",
         }
         .to_string();
 
@@ -91,7 +90,7 @@ impl BrowserState {
             rms_dbfs: app.last_rms_db,
             silence_warning: app.silence_warning,
             epub_path,
-            timeline_pos_secs: app.session.timeline_pos,
+            timeline_pos_secs,
             footer_hints,
         }
     }
@@ -102,9 +101,8 @@ impl BrowserState {
 /// Actions the browser can send back to the main app loop.
 pub enum WebAction {
     /// A recorder key action sent from the browser keyboard.
-    /// The string matches the `action` field in the browser JSON message,
-    /// e.g. `"start"`, `"punch"`, `"cancel"`.  Converted to a synthetic
-    /// `KeyEvent` in `drain_actions` and fed through `app.handle_key()`.
+    /// The string matches the `action` field in the browser JSON message.
+    /// Converted to a synthetic `KeyEvent` in `drain_actions`.
     Key(String),
 }
 

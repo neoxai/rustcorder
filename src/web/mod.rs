@@ -268,8 +268,9 @@ fn handle_browser_message(text: &str, action_tx: &ActionTx) {
         Some(name @ (
             "start" | "stop" |
             "punch" |
-            "continue_chapter" | "chapter_complete" |
-            "cancel" |
+            "play" | "pause" |
+            "jump_back" | "jump_forward" |
+            "next_chapter" |
             "retry_mic" | "edit_session" | "quit"
         )) => {
             let _ = action_tx.try_send(WebAction::Key(name.to_string()));

@@ -123,15 +123,16 @@ fn drain_actions(app: &mut App, action_rx: &ActionRx) -> bool {
                 // Map action names to the same key codes the TUI uses, then
                 // feed them through the existing state machine via handle_key.
                 let code = match name.as_str() {
-                    "start" | "stop"       => KeyCode::Char(' '),
-                    "punch"                => KeyCode::Char('p'),
-                    "continue_chapter"     => KeyCode::Char('y'),
-                    "chapter_complete"     => KeyCode::Char('n'),
-                    "cancel"               => KeyCode::Esc,
-                    "retry_mic"            => KeyCode::Char('r'),
-                    "edit_session"         => KeyCode::Char('e'),
-                    "quit"                 => KeyCode::Char('q'),
-                    _                      => continue,
+                    "start" | "stop"   => KeyCode::Char(' '),
+                    "punch"            => KeyCode::Char('p'),
+                    "play"  | "pause"  => KeyCode::Char('l'),
+                    "jump_back"        => KeyCode::Char('j'),
+                    "jump_forward"     => KeyCode::Char('k'),
+                    "next_chapter"     => KeyCode::Char('n'),
+                    "retry_mic"        => KeyCode::Char('r'),
+                    "edit_session"     => KeyCode::Char('e'),
+                    "quit"             => KeyCode::Char('q'),
+                    _                  => continue,
                 };
                 let key = KeyEvent::new(code, KeyModifiers::NONE);
                 if app.handle_key(key) {
