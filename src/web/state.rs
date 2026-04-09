@@ -21,8 +21,6 @@ pub struct BrowserState {
     pub rms_dbfs: f32,
     /// True when the silence watchdog has fired (>15 s of silence while recording).
     pub silence_warning: bool,
-    /// Current EPUB position as a CFI string, or `null` when no EPUB is loaded.
-    pub epub_cfi: Option<String>,
     /// Absolute filesystem path to the `.epub` file served by `GET /epub`.
     /// `null` when no EPUB is loaded.  Not shown in the browser UI; used
     /// internally by the `/epub` endpoint.
@@ -43,7 +41,6 @@ impl Default for BrowserState {
             elapsed_secs: 0.0,
             rms_dbfs: -100.0,
             silence_warning: false,
-            epub_cfi: None,
             epub_path: None,
             timeline_pos_secs: 0.0,
             footer_hints: String::new(),
@@ -71,18 +68,9 @@ impl BrowserState {
             .map(|s| s.elapsed().as_secs_f64())
             .unwrap_or(0.0);
 
-        let epub_cfi = app.epub_raw_cfi.clone();
+        let epub_path = app.epub_path.as_ref().map(|p| p.to_string_lossy().into_owned());
 
-        // Build the epub filesystem path from session dir + epub filename.
-        let epub_path = app.epub.as_ref().map(|e| {
-            app.session
-                .output_dir()
-                .join(e.epub_filename())
-                .to_string_lossy()
-                .into_owned()
-        });
-
-        let mode_keys = match app.mode {
+        let footer_hints = match app.mode {
             AppMode::Setup => "[Enter] Confirm   [Tab] Switch field   [Esc] Cancel",
             AppMode::Ready => "[Space] Start   [E] Edit session   [R] Re-detect mic   [Q] Quit",
             AppMode::PreCheck => "[Esc] Abort check",
@@ -91,12 +79,8 @@ impl BrowserState {
             AppMode::PunchRollback => "[Space] Punch in here   [Esc] Cancel",
             AppMode::MicError => "[R] Retry detection   [Q] Quit",
             AppMode::Fatal => "[Q] Quit",
-        };
-        let footer_hints = if app.epub.is_some() {
-            format!("{}   [← →] Scroll text", mode_keys)
-        } else {
-            mode_keys.to_string()
-        };
+        }
+        .to_string();
 
         BrowserState {
             mode,
@@ -106,7 +90,6 @@ impl BrowserState {
             elapsed_secs,
             rms_dbfs: app.last_rms_db,
             silence_warning: app.silence_warning,
-            epub_cfi,
             epub_path,
             timeline_pos_secs: app.session.timeline_pos,
             footer_hints,
@@ -118,9 +101,6 @@ impl BrowserState {
 
 /// Actions the browser can send back to the main app loop.
 pub enum WebAction {
-    /// User scrolled the epub.js rendition; update the Rust position.
-    /// Carries the raw CFI string from epub.js, preserved verbatim.
-    EpubSeek(String),
     /// A recorder key action sent from the browser keyboard.
     /// The string matches the `action` field in the browser JSON message,
     /// e.g. `"start"`, `"punch"`, `"cancel"`.  Converted to a synthetic

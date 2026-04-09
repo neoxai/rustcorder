@@ -22,7 +22,6 @@ tokio       = { version = "1", features = ["rt-multi-thread", "macros", "net", "
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
 
-epub = "2"
 zip  = "2"
 
 # Playback experiment crates (src/playback/)

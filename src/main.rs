@@ -2,7 +2,6 @@ mod app;
 mod audio;
 mod config;
 mod device;
-mod epub;
 mod export;
 mod playback;
 mod render;
@@ -120,15 +119,6 @@ fn main() -> Result<()> {
 fn drain_actions(app: &mut App, action_rx: &ActionRx) -> bool {
     while let Ok(action) = action_rx.try_recv() {
         match action {
-            WebAction::EpubSeek(raw_cfi) => {
-                if let Some(ref mut epub) = app.epub {
-                    if let Some(cfi) = crate::epub::EpubCfi::parse(&raw_cfi) {
-                        epub.seek_to_cfi(cfi);
-                        let _ = epub.save_position();
-                    }
-                }
-                app.epub_raw_cfi = Some(raw_cfi);
-            }
             WebAction::Key(name) => {
                 // Map action names to the same key codes the TUI uses, then
                 // feed them through the existing state machine via handle_key.
@@ -138,8 +128,6 @@ fn drain_actions(app: &mut App, action_rx: &ActionRx) -> bool {
                     "continue_chapter"     => KeyCode::Char('y'),
                     "chapter_complete"     => KeyCode::Char('n'),
                     "cancel"               => KeyCode::Esc,
-                    "scroll_forward"       => KeyCode::Right,
-                    "scroll_back"          => KeyCode::Left,
                     "retry_mic"            => KeyCode::Char('r'),
                     "edit_session"         => KeyCode::Char('e'),
                     "quit"                 => KeyCode::Char('q'),
@@ -201,8 +189,6 @@ fn run(state_tx: StateTx, action_rx: ActionRx) -> Result<()> {
         if drain_actions(&mut app, &action_rx) { break; }
 
         // ── Render ────────────────────────────────────────────────────────
-        let epub_pane_width = terminal.size().map(|s| s.width).unwrap_or(80);
-        app.epub_set_pane_width(epub_pane_width);
         terminal.draw(|f| render::draw(f, &app))?;
 
         // ── Broadcast state to browser clients ────────────────────────────

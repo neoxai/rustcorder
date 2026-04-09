@@ -78,10 +78,6 @@ Copy `.env` into the directory you run the binary from (it is already present in
 |---|---|---|
 | `PUNCH_BACK_TIME` | `15` | Seconds to rewind before rollback playback during punch-and-roll. Minimum: 1. |
 | `CROSSFADE_TIME` | `10ms` | Crossfade duration applied between clips during `--export`. |
-| `EPUB_SCROLL_LINES` | `1` | Lines scrolled per `→` / `←` keypress in the terminal EPUB pane. |
-| `EPUB_AUTOSCROLL` | `0` | Auto-scroll speed in lines/min during recording; `0` = off. |
-| `EPUB_PANE_RATIO` | `60` | Percentage of body height given to the terminal EPUB pane. |
-| `EPUB_PANE` | `terminal` | `terminal` shows the in-TUI pane; `browser` suppresses it (use the browser window instead); `both` shows both. |
 | `BROWSER_PORT` | `7474` | Port for the local web server. Searches up to 10 ports if the default is in use. |
 | `BROWSER_OPEN` | _(unset)_ | Set to `true` to auto-open the browser on startup via `xdg-open`. |
 
@@ -103,7 +99,6 @@ Copy `.env` into the directory you run the binary from (it is already present in
 | Post-recording | `Y` / `Enter` | Continue chapter (increment part) |
 | Post-recording | `N` | Chapter complete (advance chapter, reset part) |
 | Mic error | `R` / `Enter` | Retry microphone detection |
-| Any | `←` / `→` | Scroll EPUB pane backward / forward |
 | Any | `Ctrl-C` | Emergency stop — finalizes current file and exits |
 
 ---
@@ -116,8 +111,7 @@ $PWD/
 ├── session.save.txt              # Persisted session state
 ├── chosen.devices.txt            # Saved mic/playback device selection
 └── BookName/
-    ├── BookName.epub             # Optional — auto-discovered for the EPUB reader
-    ├── epub_position.txt         # Persisted EPUB scroll position (CFI)
+    ├── BookName.epub             # Optional — auto-discovered for the browser EPUB viewer
     ├── Chapter_01_part001.wav
     ├── Chapter_01_part002.wav
     ├── Chapter_01_timeline.txt   # Timeline index for Chapter 01
@@ -146,17 +140,6 @@ TIMELINE_POS=254.891
 ```
 
 `TIMELINE_POS` is the absolute position in seconds from the start of the current chapter where the next clip will begin.
-
-### `epub_position.txt`
-
-Persisted scroll position for the EPUB reader, stored per book directory:
-
-```
-EPUB=Beverly Cleary - Ralph 1 - The Mouse and the Motorcycle.epub
-CFI=epubcfi(/6/4!/1:48372)
-```
-
-Position is stored as an EPUB CFI (Canonical Fragment Identifier), which is layout-independent — terminal resizes re-wrap the text without losing position.
 
 ---
 
@@ -208,27 +191,15 @@ The `--export` command assembles a chapter's clips into a single finished WAV fi
 
 ## EPUB Reader
 
-If a `.epub` file is present in the book directory, rustcorder loads it automatically as a side-by-side reader.
-
-### Terminal pane
-
-- Displayed as a split pane at the bottom of the TUI.
-- `←` / `→` scroll the text by `EPUB_SCROLL_LINES` lines in any mode.
-- Auto-scroll (`EPUB_AUTOSCROLL` lines/min) advances only while actively Recording.
-- Position is saved on every manual scroll and every 5 seconds during auto-scroll.
-- Terminal width changes re-wrap the text without losing position.
-
-### Browser viewer (epub.js)
+If a `.epub` file is present in the book directory, rustcorder serves it automatically through the browser viewer. No terminal pane — the browser is the only reading interface.
 
 A local web server starts automatically on `localhost:7474` (configurable via `BROWSER_PORT`). Opening that URL in a browser shows a full epub.js rendition with:
 
 - A status bar mirroring the TUI: mode, book, chapter, part, elapsed time, VU meter.
-- The EPUB displayed at the current saved position.
-- Real-time state sync via WebSocket (~10 Hz).
-- Keyboard bindings that send recorder actions back to Rust (Space, P, Y, N, Esc, arrows).
-- Position changes in the browser are reflected in `epub_position.txt` and the terminal pane.
-
-Set `EPUB_PANE=browser` in `.env` to suppress the terminal pane and reclaim space for the recording meters when using the browser as the primary reader.
+- The EPUB displayed at the last saved reading position (persisted in browser `localStorage` per book).
+- Real-time recorder state sync via WebSocket (~10 Hz).
+- Keyboard bindings that send recorder actions back to Rust (Space, P, Y, N, Esc).
+- `←` / `→` scroll the EPUB directly in the browser; position is saved to `localStorage` automatically.
 
 Set `BROWSER_OPEN=true` to have rustcorder automatically open the browser on startup.
 
@@ -268,8 +239,7 @@ During recording, if no audio above −60 dBFS is detected for 15 consecutive se
 | `src/device.rs` | USB microphone discovery and enforcement via sysfs |
 | `src/session.rs` | Session persistence, file naming, timeline index management |
 | `src/wav.rs` | WAV file writer (fixed 48kHz/24-bit/mono format) |
-| `src/render.rs` | Terminal UI rendering (ratatui), EPUB terminal pane |
-| `src/epub.rs` | EPUB loading, CFI position tracking, line-wrapping, scroll state |
+| `src/render.rs` | Terminal UI rendering (ratatui) |
 | `src/config.rs` | `--config` device wizard |
 | `src/web/mod.rs` | axum HTTP/WebSocket server (browser viewer) |
 | `src/web/state.rs` | `BrowserState` snapshot struct, channel types |
@@ -315,6 +285,5 @@ Setup ────────────────────────�
 | `axum` | HTTP and WebSocket server for the browser viewer |
 | `tokio` | Async runtime for the web server thread |
 | `serde` / `serde_json` | JSON serialization for WebSocket state messages |
-| `epub` | EPUB parsing (spine extraction, text content) |
-| `zip` | ZIP access underlying EPUB files |
+| `zip` | ZIP extraction for serving EPUB file contents via the web server |
 | `rodio` / `cpal` / `libpulse-*` | Experimental playback backends (`--playback`) |

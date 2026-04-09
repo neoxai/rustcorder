@@ -158,8 +158,6 @@
 let currentMode   = 'Init';
 let rendition     = null;
 let bookLoaded    = false;
-let lastSentCfi   = null;    // CFI we sent to Rust; skip its echo
-let pendingSeekCfi = null;   // CFI to display once book is ready
 let currentEpubPath = null;
 
 // ── WebSocket ──────────────────────────────────────────────────────────────
@@ -220,8 +218,8 @@ document.addEventListener('keydown', e => {
   const key = e.code;
   if (ABSORB.has(key)) e.preventDefault();
 
-  // ← / → scroll the EPUB directly in the browser; position syncs back to
-  // Rust via the relocated event, so no round-trip needed.
+  // ← / → scroll the EPUB directly in the browser; position is saved to
+  // localStorage via the relocated event.
   if (key === 'ArrowRight') { if (rendition) rendition.next(); return; }
   if (key === 'ArrowLeft')  { if (rendition) rendition.prev(); return; }
 
@@ -304,20 +302,17 @@ function loadEpub() {
     });
   });
 
-  rendition.display().then(() => {
+  // Restore saved position from localStorage (keyed by epub path).
+  const savedCfi = localStorage.getItem('epub_pos:' + currentEpubPath);
+  rendition.display(savedCfi || undefined).then(() => {
     bookLoaded = true;
-    if (pendingSeekCfi) {
-      seekTo(pendingSeekCfi);
-      pendingSeekCfi = null;
-    }
   }).catch(err => console.warn('epub display error:', err));
 
-  // Send position back to Rust when the user scrolls.
+  // Save position to localStorage when the user scrolls.
   rendition.on('relocated', location => {
     const cfi = location?.start?.cfi;
     if (!cfi) return;
-    lastSentCfi = cfi;
-    send({ action: 'epub_seek', cfi });
+    localStorage.setItem('epub_pos:' + currentEpubPath, cfi);
   });
 }
 
@@ -340,25 +335,12 @@ function handleStateEpub(state) {
   if (state.epub_path !== currentEpubPath) {
     currentEpubPath = state.epub_path;
     bookLoaded = false;
-    lastSentCfi = null;
     if (rendition) { try { rendition.destroy(); } catch {} }
     viewer.innerHTML = '';
     loadEpub();
   }
-
-  // Seek unless it's our own echo.
-  if (state.epub_cfi && state.epub_cfi !== lastSentCfi) {
-    if (bookLoaded) {
-      seekTo(state.epub_cfi);
-    } else {
-      pendingSeekCfi = state.epub_cfi;
-    }
-  }
 }
 
-function seekTo(cfi) {
-  if (rendition) rendition.display(cfi).catch(() => {});
-}
 
 // ── Status bar ─────────────────────────────────────────────────────────────
 

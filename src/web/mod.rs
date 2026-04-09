@@ -263,12 +263,6 @@ fn handle_browser_message(text: &str, action_tx: &ActionTx) {
         return;
     };
     match v.get("action").and_then(|a| a.as_str()) {
-        Some("epub_seek") => {
-            let cfi_str = v.get("cfi").and_then(|c| c.as_str()).unwrap_or("");
-            if !cfi_str.is_empty() {
-                let _ = action_tx.try_send(WebAction::EpubSeek(cfi_str.to_string()));
-            }
-        }
         // Recorder key actions — forwarded as WebAction::Key and converted to
         // synthetic KeyEvents in drain_actions.
         Some(name @ (
@@ -276,7 +270,6 @@ fn handle_browser_message(text: &str, action_tx: &ActionTx) {
             "punch" |
             "continue_chapter" | "chapter_complete" |
             "cancel" |
-            "scroll_forward" | "scroll_back" |
             "retry_mic" | "edit_session" | "quit"
         )) => {
             let _ = action_tx.try_send(WebAction::Key(name.to_string()));
