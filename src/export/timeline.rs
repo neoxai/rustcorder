@@ -195,6 +195,11 @@ fn resolve_clips(
 
 // ── Crossfade mixing ──────────────────────────────────────────────────────────
 
+/// Concatenate clip sample buffers with no overlap.
+fn concat_clips(clips: &[Vec<i32>]) -> Vec<i32> {
+    clips.iter().flat_map(|c| c.iter().copied()).collect()
+}
+
 /// Concatenate clip sample buffers with a linear crossfade at each boundary.
 ///
 /// At the transition between clip A and clip B:
@@ -255,7 +260,9 @@ fn crossfade_concat(clips: &[Vec<i32>], cf_samples: usize) -> Vec<i32> {
                 let t = j as f64 / cf as f64;
                 let a = clip[a_start + j] as f64;
                 let b = next[j] as f64;
-                let mixed = a * (1.0 - t) + b * t;
+                let a_gain = (std::f64::consts::FRAC_PI_2 * (1.0 - t)).cos();
+                let b_gain = (std::f64::consts::FRAC_PI_2 * t).sin();
+                let mixed = a * a_gain + b * b_gain;
                 result.push(mixed.round().clamp(-8_388_608.0, 8_388_607.0) as i32);
             }
         }
@@ -536,16 +543,21 @@ pub struct ExportOptions {
 
 /// Export a single chapter to a combined WAV file.
 ///
-/// Writes per-clip trimmed WAVs to `<book_dir>/temp/` (cleared first) for
-/// debugging, then the final mixed file to `<book_dir>/out/Chapter_NN.wav`.
+/// Phase 1: writes trimmed per-clip WAVs to `<book_dir>/temp/trimmed/`
+/// (that folder is cleared first; the rest of `temp/` is left untouched).
+/// Files are named `Chapter_NN_trimmedNNN.wav` and contain exactly the samples
+/// that will appear in the final output — no crossfade applied.
+///
+/// Phase 2: reads those files back from disk and either crossfades or
+/// concatenates them, then writes the result to `<book_dir>/out/Chapter_NN.wav`.
 ///
 /// Returns the path of the written output file.
 pub fn export_chapter(book_dir: &Path, chapter: u32, opts: &ExportOptions) -> Result<PathBuf> {
     let timeline_path = book_dir.join(format!("Chapter_{:02}_timeline.txt", chapter));
 
-    let crossfade_ms    = opts.crossfade_ms;
-    let discard_short   = opts.discard_short_clips;
-    let discard_secs    = opts.discard_duration_secs.max(0.0);
+    let crossfade_ms  = opts.crossfade_ms;
+    let discard_short = opts.discard_short_clips;
+    let discard_secs  = opts.discard_duration_secs.max(0.0);
 
     // 1. Parse and resolve.
     let entries = parse_timeline(&timeline_path)?;
@@ -558,39 +570,57 @@ pub fn export_chapter(book_dir: &Path, chapter: u32, opts: &ExportOptions) -> Re
         );
     }
 
-    // 2. Clear the temp directory.
-    let temp_dir = book_dir.join("temp");
-    if temp_dir.exists() {
-        fs::remove_dir_all(&temp_dir)
-            .with_context(|| format!("clearing temp dir {}", temp_dir.display()))?;
+    // 2. Prepare temp/trimmed — clear if present, create if absent.
+    //    Other subdirectories inside temp/ are left untouched.
+    let trimmed_dir = book_dir.join("temp").join("trimmed");
+    if trimmed_dir.exists() {
+        fs::remove_dir_all(&trimmed_dir)
+            .with_context(|| format!("clearing trimmed dir {}", trimmed_dir.display()))?;
     }
-    fs::create_dir_all(&temp_dir)?;
+    fs::create_dir_all(&trimmed_dir)?;
 
     let cf_samples = ((crossfade_ms / 1000.0) * SAMPLE_RATE as f64).round() as usize;
 
-    // 3. Read each clip region and write a trimmed temp WAV.
-    let mut all_samples: Vec<Vec<i32>> = Vec::with_capacity(clips.len());
+    // 3. Phase 1: read each resolved clip and write a trimmed WAV to temp/trimmed/.
+    let mut trimmed_paths: Vec<PathBuf> = Vec::with_capacity(clips.len());
 
     for (idx, clip) in clips.iter().enumerate() {
         let samples =
             read_wav_samples(&clip.path, clip.sample_offset, clip.sample_count)
                 .with_context(|| format!("reading {}", clip.path.display()))?;
 
-        // Write trimmed clip to temp for debugging.
-        let temp_name = format!("clip_{:03}_{}.wav", idx + 1, clip.label);
-        let temp_path = temp_dir.join(&temp_name);
-        let mut w = WavWriter::new(&temp_path)
-            .with_context(|| format!("creating temp file {}", temp_path.display()))?;
+        let name = format!("Chapter_{:02}_trimmed{:03}.wav", chapter, idx + 1);
+        let path = trimmed_dir.join(&name);
+        let mut w = WavWriter::new(&path)
+            .with_context(|| format!("creating trimmed file {}", path.display()))?;
         w.write_s24le(&samples)?;
         w.finalize()?;
 
+        trimmed_paths.push(path);
+    }
+
+    // 4. Phase 2: re-read trimmed files from disk.
+    let mut all_samples: Vec<Vec<i32>> = Vec::with_capacity(trimmed_paths.len());
+
+    for path in &trimmed_paths {
+        if !path.exists() {
+            anyhow::bail!("expected trimmed file not found: {}", path.display());
+        }
+        let count = wav_sample_count(path)
+            .with_context(|| format!("reading header of {}", path.display()))?;
+        let samples = read_wav_samples(path, 0, count)
+            .with_context(|| format!("reading trimmed file {}", path.display()))?;
         all_samples.push(samples);
     }
 
-    // 4. Crossfade and concatenate.
-    let final_samples = crossfade_concat(&all_samples, cf_samples);
+    // 5. Apply crossfade or straight concatenation.
+    let final_samples = if cf_samples > 0 {
+        crossfade_concat(&all_samples, cf_samples)
+    } else {
+        concat_clips(&all_samples)
+    };
 
-    // 5. Write output.
+    // 6. Write output.
     let out_dir = book_dir.join("out");
     fs::create_dir_all(&out_dir)?;
     let out_path = out_dir.join(format!("Chapter_{:02}.wav", chapter));
