@@ -114,7 +114,12 @@ pub struct App {
 }
 
 impl App {
-    pub fn new() -> Self {
+    /// Construct with explicitly resolved options (used by the `record` CLI command).
+    pub fn new_with_options(
+        punch_back_time: f64,
+        discard_short_clips: bool,
+        discard_duration_secs: f64,
+    ) -> Self {
         let session = session::load().unwrap_or_else(|| Session::new(String::new(), 1));
         let mode = if session.book.is_empty() {
             AppMode::Setup
@@ -124,21 +129,6 @@ impl App {
 
         let setup_book = session.book.clone();
         let setup_chapter = format!("{:02}", session.chapter);
-
-        let punch_back_time = std::env::var("PUNCH_BACK_TIME")
-            .ok()
-            .and_then(|v| v.trim().trim_end_matches('s').parse::<f64>().ok())
-            .unwrap_or(15.0)
-            .max(1.0);
-
-        let discard_short_clips = std::env::var("DISCARD_SHORT_CLIPS")
-            .map(|v| v.trim().eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        let discard_duration_secs = std::env::var("DISCARD_DURATION")
-            .ok()
-            .and_then(|v| v.trim().trim_end_matches('s').parse::<f64>().ok())
-            .unwrap_or(1.0)
-            .max(0.0);
 
         let epub_path = if !session.book.is_empty() {
             find_epub_in_dir(&session.output_dir())

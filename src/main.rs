@@ -1,5 +1,6 @@
 mod app;
 mod audio;
+mod cli;
 mod config;
 mod device;
 mod export;
@@ -15,6 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use clap::Parser;
 use crossterm::{
     event::{self, Event},
     execute,
@@ -23,67 +25,33 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, Terminal};
 
 use app::App;
+use cli::{Cli, Commands};
+use cli::record::RecordOptions;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use web::state::{ActionRx, BrowserState, StateTx, WebAction};
 
 fn main() -> Result<()> {
-    // Load .env from the current working directory into the process environment.
-    // Silently ignored if the file is absent; shell env vars take precedence.
+    // Load .env from the current working directory.  Silently ignored if
+    // absent; shell env vars take precedence.
     dotenvy::dotenv().ok();
 
-    // `--config` runs before the TUI — plain stdin/stdout, no raw mode.
-    if std::env::args().any(|a| a == "--config") {
-        return config::run_config();
+    let cli = Cli::parse();
+
+    match cli.command.unwrap_or_else(|| Commands::Record(cli::record::RecordArgs::default())) {
+        Commands::Config(args)   => cli::config::run(&args),
+        Commands::Export(args)   => cli::export::run(&args),
+        Commands::Playback(args) => cli::playback::run(&args),
+        Commands::Record(args)   => {
+            let opts = RecordOptions::resolve(&args)?;
+            run_record(opts)
+        }
     }
+}
 
-    // `--export` reconstructs a chapter from its timeline and clip files.
-    if std::env::args().any(|a| a == "--export") {
-        let args: Vec<String> = std::env::args().collect();
-        let book = args
-            .windows(2)
-            .find(|w| w[0] == "--book")
-            .map(|w| w[1].clone())
-            .ok_or_else(|| anyhow::anyhow!("--book <name> is required with --export"))?;
-        let chapter: u32 = args
-            .windows(2)
-            .find(|w| w[0] == "--chapter")
-            .and_then(|w| w[1].parse().ok())
-            .ok_or_else(|| anyhow::anyhow!("--chapter <n> is required with --export"))?;
-        let crossfade_ms = std::env::var("CROSSFADE_TIME")
-            .ok()
-            .and_then(|v| v.trim().trim_end_matches("ms").parse::<f64>().ok())
-            .unwrap_or(10.0);
-        let book_dir = std::path::Path::new(&book);
-        let out = export::timeline::export_chapter(book_dir, chapter, crossfade_ms)?;
-        println!("Exported: {}", out.display());
-        return Ok(());
-    }
+fn run_record(opts: RecordOptions) -> Result<()> {
+    let (web_port, state_tx, action_rx) = web::spawn(opts.browser_port)?;
 
-    // `--playback` runs before the TUI — terminal only, no alternate screen.
-    if std::env::args().any(|a| a == "--playback") {
-        let args: Vec<String> = std::env::args().collect();
-        let player_type = args
-            .windows(2)
-            .find(|w| w[0] == "--type")
-            .and_then(|w| w[1].parse::<u8>().ok())
-            .unwrap_or(1);
-        let file = args
-            .windows(2)
-            .find(|w| w[0] == "--file")
-            .map(|w| std::path::PathBuf::from(&w[1]))
-            .ok_or_else(|| anyhow::anyhow!("--file <path> is required with --playback"))?;
-        return playback::run(player_type, &file);
-    }
-
-    // Start the local web server.  Returns the bound port, a channel sender
-    // for pushing state snapshots, and a receiver for browser actions.
-    let (web_port, state_tx, action_rx) = web::spawn()?;
-
-    // Auto-open browser if BROWSER_OPEN=true.
-    if std::env::var("BROWSER_OPEN")
-        .map(|v| v.trim().eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-    {
+    if opts.browser_open {
         let _ = std::process::Command::new("xdg-open")
             .arg(format!("http://localhost:{web_port}/"))
             .stderr(std::process::Stdio::null())
@@ -91,19 +59,15 @@ fn main() -> Result<()> {
             .spawn();
     }
 
-    let web_mode = std::env::var("WEB_MODE")
-        .map(|v| v.trim().eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-
-    if web_mode {
-        return run_headless(web_port, state_tx, action_rx);
+    if opts.web_mode {
+        return run_headless(web_port, state_tx, action_rx, &opts);
     }
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
 
-    let result = run(state_tx, action_rx);
+    let result = run_tui(state_tx, action_rx, &opts);
 
     // Always restore terminal, even on error.
     let _ = disable_raw_mode();
@@ -146,14 +110,18 @@ fn drain_actions(app: &mut App, action_rx: &ActionRx) -> bool {
 
 // ── Headless loop ─────────────────────────────────────────────────────────────
 
-fn run_headless(port: u16, state_tx: StateTx, action_rx: ActionRx) -> Result<()> {
-    eprintln!("rustcorder [WEB_MODE]: open http://localhost:{port}/ in your browser");
-    eprintln!("rustcorder [WEB_MODE]: press Ctrl-C to quit");
+fn run_headless(port: u16, state_tx: StateTx, action_rx: ActionRx, opts: &RecordOptions) -> Result<()> {
+    eprintln!("rustcorder [web_mode]: open http://localhost:{port}/ in your browser");
+    eprintln!("rustcorder [web_mode]: press Ctrl-C to quit");
 
     let sigterm = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&sigterm))?;
 
-    let mut app = App::new();
+    let mut app = App::new_with_options(
+        opts.punch_back_time,
+        opts.discard_short_clips,
+        opts.discard_duration_secs,
+    );
     app.detect_mic();
 
     loop {
@@ -175,14 +143,18 @@ fn run_headless(port: u16, state_tx: StateTx, action_rx: ActionRx) -> Result<()>
 
 // ── TUI loop ──────────────────────────────────────────────────────────────────
 
-fn run(state_tx: StateTx, action_rx: ActionRx) -> Result<()> {
+fn run_tui(state_tx: StateTx, action_rx: ActionRx, opts: &RecordOptions) -> Result<()> {
     let sigterm = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&sigterm))?;
 
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new();
+    let mut app = App::new_with_options(
+        opts.punch_back_time,
+        opts.discard_short_clips,
+        opts.discard_duration_secs,
+    );
     app.detect_mic();
 
     loop {

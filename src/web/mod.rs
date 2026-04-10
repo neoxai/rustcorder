@@ -27,7 +27,6 @@ use tokio::sync::watch;
 
 use state::{ActionTx, ActionRx, BrowserState, StateTx, WebAction};
 
-const DEFAULT_PORT: u16 = 7474;
 const PORT_SEARCH_RANGE: u16 = 10;
 
 // ── Shared server state ───────────────────────────────────────────────────────
@@ -43,11 +42,11 @@ struct ServerState {
 /// - the bound port
 /// - `StateTx` to push state snapshots from the app loop
 /// - `ActionRx` to drain browser actions (epub_seek, etc.) from the app loop
-pub fn spawn() -> Result<(u16, StateTx, ActionRx)> {
-    let start = std::env::var("BROWSER_PORT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_PORT);
+///
+/// `start_port` is the first port to try; the server searches up to
+/// `start_port + PORT_SEARCH_RANGE - 1` if the first is in use.
+pub fn spawn(start_port: u16) -> Result<(u16, StateTx, ActionRx)> {
+    let start = start_port;
 
     let (port, std_listener) = (start..start + PORT_SEARCH_RANGE)
         .find_map(|p| {

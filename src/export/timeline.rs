@@ -522,27 +522,30 @@ pub fn chapter_end(
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
+/// Options for [`export_chapter`].  All values must be resolved by the caller
+/// (e.g. from CLI flags or env vars) before calling.
+pub struct ExportOptions {
+    /// Crossfade duration at clip boundaries, in milliseconds.
+    pub crossfade_ms: f64,
+    /// Skip clips whose total WAV duration is below `discard_duration_secs`.
+    pub discard_short_clips: bool,
+    /// Minimum clip duration in seconds; clips shorter than this are dropped
+    /// when `discard_short_clips` is `true`.
+    pub discard_duration_secs: f64,
+}
+
 /// Export a single chapter to a combined WAV file.
-///
-/// Reads `DISCARD_SHORT_CLIPS` and `DISCARD_DURATION` from the process
-/// environment (already loaded from `.env` by `main`).
 ///
 /// Writes per-clip trimmed WAVs to `<book_dir>/temp/` (cleared first) for
 /// debugging, then the final mixed file to `<book_dir>/out/Chapter_NN.wav`.
 ///
 /// Returns the path of the written output file.
-pub fn export_chapter(book_dir: &Path, chapter: u32, crossfade_ms: f64) -> Result<PathBuf> {
+pub fn export_chapter(book_dir: &Path, chapter: u32, opts: &ExportOptions) -> Result<PathBuf> {
     let timeline_path = book_dir.join(format!("Chapter_{:02}_timeline.txt", chapter));
 
-    // DISCARD settings from environment.
-    let discard_short = std::env::var("DISCARD_SHORT_CLIPS")
-        .map(|v| v.trim().eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    let discard_secs = std::env::var("DISCARD_DURATION")
-        .ok()
-        .and_then(|v| v.trim().trim_end_matches('s').parse::<f64>().ok())
-        .unwrap_or(1.0)
-        .max(0.0);
+    let crossfade_ms    = opts.crossfade_ms;
+    let discard_short   = opts.discard_short_clips;
+    let discard_secs    = opts.discard_duration_secs.max(0.0);
 
     // 1. Parse and resolve.
     let entries = parse_timeline(&timeline_path)?;
