@@ -1,9 +1,0 @@
-# rustcorder timeline — MouseAndMotorcycle / Chapter 03
-CLIP Chapter_03_part001.wav START=0.000
-CLIP Chapter_03_part003.wav START=7.253
-CLIP Chapter_03_part004.wav START=5.038
-CLIP Chapter_03_part005.wav START=7.960
-CLIP Chapter_03_part006.wav START=12.099
-CLIP Chapter_03_part007.wav START=17.155
-CLIP Chapter_03_part008.wav START=19.352
-CLIP Chapter_03_part009.wav START=3.593

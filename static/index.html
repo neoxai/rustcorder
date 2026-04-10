@@ -297,6 +297,7 @@ function loadEpub() {
     contents.document.addEventListener('keydown', e => {
       if (e.code === 'ArrowRight') { e.preventDefault(); if (rendition) rendition.next(); return; }
       if (e.code === 'ArrowLeft')  { e.preventDefault(); if (rendition) rendition.prev(); return; }
+      if (e.code === 'Space') e.preventDefault();
       document.dispatchEvent(new KeyboardEvent('keydown', {
         code: e.code, key: e.key, bubbles: true,
         shiftKey: e.shiftKey, ctrlKey: e.ctrlKey, altKey: e.altKey,
