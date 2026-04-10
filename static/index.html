@@ -197,7 +197,12 @@ function connect() {
 // WebSocket handshake completes.
 fetch('/state')
   .then(r => r.json())
-  .then(state => { handleStateEpub(state); })
+  .then(state => {
+    currentMode = state.mode || 'Init';
+    updateStatusBar(state);
+    updateFooter(state);
+    handleStateEpub(state);
+  })
   .catch(() => {});
 
 connect();
