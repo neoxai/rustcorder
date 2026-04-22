@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use anyhow::{bail, Result};
 use clap::Args;
 
@@ -15,6 +17,11 @@ const VALID_KEYS: &[&str] = &[
 /// Record an audiobook chapter (opens the TUI or web UI)
 #[derive(Args, Default)]
 pub struct RecordArgs {
+    /// Book folder to record into (looked up inside $DEFAULT_RECORDING_DIR).
+    /// Skips the setup screen if provided.
+    #[arg(long)]
+    pub book: Option<String>,
+
     /// Override a default option (repeatable).
     ///
     /// Valid keys:
@@ -36,6 +43,10 @@ pub struct RecordOptions {
     pub web_mode: bool,
     pub browser_open: bool,
     pub browser_port: u16,
+    /// Base directory where book folders are stored (from $DEFAULT_RECORDING_DIR).
+    pub recording_dir: PathBuf,
+    /// Book name pre-selected on the command line (skips the setup screen).
+    pub book: Option<String>,
 }
 
 impl RecordOptions {
@@ -108,6 +119,12 @@ impl RecordOptions {
             bail!("browser_port must be > 0");
         }
 
+        let recording_dir = PathBuf::from(
+            std::env::var("DEFAULT_RECORDING_DIR").unwrap_or_else(|_| "./recordings".to_string()),
+        );
+
+        let book = args.book.clone();
+
         Ok(RecordOptions {
             punch_back_time,
             discard_short_clips,
@@ -115,6 +132,8 @@ impl RecordOptions {
             web_mode,
             browser_open,
             browser_port,
+            recording_dir,
+            book,
         })
     }
 }

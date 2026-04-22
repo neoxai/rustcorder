@@ -20,16 +20,25 @@ pub struct Session {
     /// recording clip should begin.  Updated after each clip stops or a
     /// punch-in point is confirmed.
     pub timeline_pos: f64,
+    /// Base directory where all book folders live.  Resolved from
+    /// `DEFAULT_RECORDING_DIR` at startup; not persisted to the session file.
+    pub base_dir: PathBuf,
 }
 
 impl Session {
     pub fn new(book: String, chapter: u32) -> Self {
-        Session { book, chapter, part: 1, timeline_pos: 0.0 }
+        Session {
+            book,
+            chapter,
+            part: 1,
+            timeline_pos: 0.0,
+            base_dir: PathBuf::from("."),
+        }
     }
 
-    /// Directory where recordings for this book are stored: `$PWD/<book>/`
+    /// Directory where recordings for this book are stored: `<base_dir>/<book>/`
     pub fn output_dir(&self) -> PathBuf {
-        PathBuf::from(&self.book)
+        self.base_dir.join(&self.book)
     }
 
     /// Full path for the current part file: `<book>/Chapter_NN_partNNN.wav`
@@ -161,6 +170,7 @@ pub fn load() -> Option<Session> {
         chapter: chapter?,
         part: part?,
         timeline_pos,
+        base_dir: PathBuf::from("."),
     })
 }
 

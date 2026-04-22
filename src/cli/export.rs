@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use anyhow::{bail, Result};
 use clap::Args;
 
@@ -74,8 +72,11 @@ pub fn run(args: &ExportArgs) -> Result<()> {
         discard_duration_secs: discard_duration_secs.max(0.0),
     };
 
-    let book_dir = Path::new(&args.book);
-    let out = export_chapter(book_dir, args.chapter, &opts)?;
+    let recording_dir = std::path::PathBuf::from(
+        std::env::var("DEFAULT_RECORDING_DIR").unwrap_or_else(|_| "./recordings".to_string()),
+    );
+    let book_dir = recording_dir.join(&args.book);
+    let out = export_chapter(&book_dir, args.chapter, &opts)?;
     println!("Exported: {}", out.display());
     Ok(())
 }

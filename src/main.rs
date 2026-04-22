@@ -121,6 +121,8 @@ fn run_headless(port: u16, state_tx: StateTx, action_rx: ActionRx, opts: &Record
         opts.punch_back_time,
         opts.discard_short_clips,
         opts.discard_duration_secs,
+        opts.recording_dir.clone(),
+        opts.book.clone(),
     );
     app.detect_mic();
 
@@ -154,6 +156,8 @@ fn run_tui(state_tx: StateTx, action_rx: ActionRx, opts: &RecordOptions) -> Resu
         opts.punch_back_time,
         opts.discard_short_clips,
         opts.discard_duration_secs,
+        opts.recording_dir.clone(),
+        opts.book.clone(),
     );
     app.detect_mic();
 

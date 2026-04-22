@@ -119,8 +119,24 @@ impl App {
         punch_back_time: f64,
         discard_short_clips: bool,
         discard_duration_secs: f64,
+        recording_dir: std::path::PathBuf,
+        book_override: Option<String>,
     ) -> Self {
-        let session = session::load().unwrap_or_else(|| Session::new(String::new(), 1));
+        let mut session = session::load().unwrap_or_else(|| Session::new(String::new(), 1));
+
+        // Apply the base recording directory resolved from DEFAULT_RECORDING_DIR.
+        session.base_dir = recording_dir;
+
+        // If --book was given on the command line, apply it now.
+        if let Some(book) = book_override {
+            if session.book != book {
+                session.book = book;
+                session.chapter = 1;
+                session.part = 1;
+                session.timeline_pos = 0.0;
+            }
+        }
+
         let mode = if session.book.is_empty() {
             AppMode::Setup
         } else {

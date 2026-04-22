@@ -1,6 +1,0 @@
-# rustcorder timeline — TestBook2 / Chapter 01
-CLIP Chapter_01_part001.wav START=0.000
-CLIP Chapter_01_part002.wav START=13.684
-CLIP Chapter_01_part003.wav START=15.369
-CLIP Chapter_01_part004.wav START=17.310
-CLIP Chapter_01_part005.wav START=49.524
