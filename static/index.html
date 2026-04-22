@@ -253,8 +253,8 @@ document.addEventListener('keydown', e => {
   if (key === 'ArrowLeft')  { if (rendition) rendition.prev(); return; }
 
   // - / _ → zoom out PDF;  + / = → zoom in PDF (active whenever a PDF is shown).
-  if (currentPdfPath && key === 'Minus') { pdfZoom = Math.max(0.5, pdfZoom - 0.25); renderPdfPages(); return; }
-  if (currentPdfPath && key === 'Equal') { pdfZoom = Math.min(4.0, pdfZoom + 0.25); renderPdfPages(); return; }
+  if (currentPdfPath && key === 'Minus') { pdfZoom = Math.max(0.5, pdfZoom - 0.25); applyPdfZoom(); return; }
+  if (currentPdfPath && key === 'Equal') { pdfZoom = Math.min(4.0, pdfZoom + 0.25); applyPdfZoom(); return; }
 
   switch (currentMode) {
     case 'Standby':
@@ -420,6 +420,8 @@ async function loadPdf() {
   await renderPdfPages();
 }
 
+// Render all pages once at initial zoom resolution. Never called again for zoom
+// changes — applyPdfZoom() handles those via CSS only, preserving scroll.
 async function renderPdfPages() {
   if (!pdfDoc) return;
 
@@ -427,29 +429,40 @@ async function renderPdfPages() {
   const pdfViewer = document.getElementById('pdf-viewer');
   pdfViewer.innerHTML = '';
 
-  const dpr = window.devicePixelRatio || 1;
+  const dpr  = window.devicePixelRatio || 1;
+  const fitW = pdfViewer.clientWidth || 800; // container width = 1× fit
 
   for (let pageNum = 1; pageNum <= pdfDoc.numPages; pageNum++) {
-    if (pdfRenderGen !== gen) return; // aborted by a newer render
+    if (pdfRenderGen !== gen) return; // aborted by a book change
 
     const page     = await pdfDoc.getPage(pageNum);
     const viewport = page.getViewport({ scale: 1 });
 
-    // Fit to container width, then apply the user's zoom multiplier.
-    const cssW   = (pdfViewer.clientWidth || 800) * pdfZoom;
-    const scale  = (cssW / viewport.width) * dpr;
-    const vp     = page.getViewport({ scale });
+    // Render at initial pdfZoom × DPR for sharp text at the default zoom level.
+    const renderScale = (fitW * pdfZoom / viewport.width) * dpr;
+    const vp          = page.getViewport({ scale: renderScale });
 
     const canvas = document.createElement('canvas');
-    const ctx    = canvas.getContext('2d');
-    canvas.width        = vp.width;
-    canvas.height       = vp.height;
-    canvas.style.width  = (vp.width  / dpr) + 'px';
-    canvas.style.height = (vp.height / dpr) + 'px';
+    canvas.width  = vp.width;
+    canvas.height = vp.height;
+    // Store the per-page fit dimensions so applyPdfZoom can scale them.
+    canvas.dataset.fitW = String(fitW);
+    canvas.dataset.fitH = String(fitW * viewport.height / viewport.width);
+    // Display at current zoom.
+    canvas.style.width  = (fitW * pdfZoom) + 'px';
+    canvas.style.height = (fitW * viewport.height / viewport.width * pdfZoom) + 'px';
 
     pdfViewer.appendChild(canvas);
-    await page.render({ canvasContext: ctx, viewport: vp }).promise;
+    await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise;
   }
+}
+
+// Rescale all rendered canvases to the current pdfZoom — no re-render needed.
+function applyPdfZoom() {
+  document.querySelectorAll('#pdf-viewer canvas').forEach(c => {
+    c.style.width  = (parseFloat(c.dataset.fitW) * pdfZoom) + 'px';
+    c.style.height = (parseFloat(c.dataset.fitH) * pdfZoom) + 'px';
+  });
 }
 
 
