@@ -106,8 +106,11 @@ pub struct App {
     pub discard_short_clips: bool,
     pub discard_duration_secs: f64,
 
-    // ── EPUB path (for browser viewer) ───────────────────────────────────
+    // ── Book paths (for browser viewer) ──────────────────────────────────
+    /// Absolute path to the `.epub` file, if present. Takes priority over PDF.
     pub epub_path: Option<std::path::PathBuf>,
+    /// Absolute path to the `.pdf` file; set only when `epub_path` is `None`.
+    pub pdf_path: Option<std::path::PathBuf>,
 
     // ── Quit flag ─────────────────────────────────────────────────────────
     pub should_quit: bool,
@@ -151,6 +154,11 @@ impl App {
         } else {
             None
         };
+        let pdf_path = if epub_path.is_none() && !session.book.is_empty() {
+            find_pdf_in_dir(&session.output_dir())
+        } else {
+            None
+        };
 
         App {
             session,
@@ -185,6 +193,7 @@ impl App {
             discard_short_clips,
             discard_duration_secs,
             epub_path,
+            pdf_path,
             should_quit: false,
         }
     }
@@ -208,10 +217,15 @@ impl App {
         }
     }
 
-    // ── EPUB path refresh ─────────────────────────────────────────────────────
+    // ── Book path refresh ─────────────────────────────────────────────────────
 
-    fn refresh_epub_path(&mut self) {
+    fn refresh_book_paths(&mut self) {
         self.epub_path = find_epub_in_dir(&self.session.output_dir());
+        self.pdf_path = if self.epub_path.is_none() {
+            find_pdf_in_dir(&self.session.output_dir())
+        } else {
+            None
+        };
     }
 
     // ── Keyboard handling ─────────────────────────────────────────────────────
@@ -305,7 +319,7 @@ impl App {
 
         let _ = session::save(&self.session);
         self.setup_error = None;
-        self.refresh_epub_path();
+        self.refresh_book_paths();
         self.mode = AppMode::Standby;
     }
 
@@ -729,7 +743,7 @@ impl App {
     fn advance_chapter_cmd(&mut self) {
         self.session.advance_chapter();
         let _ = session::save(&self.session);
-        self.refresh_epub_path();
+        self.refresh_book_paths();
         self.status_msg = Some(format!(
             "Advanced to Chapter {:02}.",
             self.session.chapter
@@ -976,13 +990,24 @@ impl App {
     }
 }
 
-// ── EPUB discovery ────────────────────────────────────────────────────────────
+// ── Book file discovery ───────────────────────────────────────────────────────
 
 fn find_epub_in_dir(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     let rd = std::fs::read_dir(dir).ok()?;
     for entry in rd.flatten() {
         let path = entry.path();
         if path.extension().map(|e| e == "epub").unwrap_or(false) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn find_pdf_in_dir(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let rd = std::fs::read_dir(dir).ok()?;
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.extension().map(|e| e == "pdf").unwrap_or(false) {
             return Some(path);
         }
     }

@@ -94,9 +94,12 @@ async fn serve(
         .route("/", get(index))
         .route("/epub.min.js", get(epubjs_handler))
         .route("/jszip.min.js", get(jszip_handler))
+        .route("/pdf.min.js", get(pdfjs_handler))
+        .route("/pdf.worker.min.js", get(pdfjs_worker_handler))
         .route("/state", get(state_handler))
         .route("/ws", get(ws_handler))
         .route("/book/*path", get(book_file_handler))
+        .route("/pdf", get(pdf_handler))
         .with_state(server_state);
 
     let listener = tokio::net::TcpListener::from_std(std_listener)
@@ -127,6 +130,44 @@ async fn epubjs_handler() -> impl IntoResponse {
         &include_bytes!("../../static/epub.min.js")[..],
     )
         .into_response()
+}
+
+async fn pdfjs_handler() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        &include_bytes!("../../static/pdf.min.js")[..],
+    )
+        .into_response()
+}
+
+async fn pdfjs_worker_handler() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        &include_bytes!("../../static/pdf.worker.min.js")[..],
+    )
+        .into_response()
+}
+
+/// Serve the raw PDF file for the currently loaded book.
+async fn pdf_handler(State(ss): State<Arc<ServerState>>) -> impl IntoResponse {
+    let pdf_path = ss.rx.borrow().pdf_path.clone();
+    let Some(pdf_path) = pdf_path else {
+        return (StatusCode::NOT_FOUND, "No PDF loaded").into_response();
+    };
+
+    let result = tokio::task::spawn_blocking(move || {
+        std::fs::read(&pdf_path)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(bytes)) => (
+            [(header::CONTENT_TYPE, "application/pdf")],
+            bytes,
+        )
+            .into_response(),
+        _ => (StatusCode::NOT_FOUND, "PDF file not found").into_response(),
+    }
 }
 
 /// Serve individual files from inside the EPUB zip at `/book/<path>`.

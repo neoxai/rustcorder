@@ -86,6 +86,24 @@
       border: none;
     }
 
+    /* ── PDF viewer ───────────────────────────────────── */
+    #pdf-viewer {
+      display: none;
+      flex: 1;
+      min-height: 0;
+      overflow-y: auto;
+      background: #1a1714;
+      align-items: center;
+      flex-direction: column;
+    }
+    #pdf-viewer.visible { display: flex; }
+
+    #pdf-viewer canvas {
+      display: block;
+      max-width: 100%;
+      margin: 0 auto 8px;
+    }
+
     /* ── No-epub placeholder ──────────────────────────── */
     #no-epub {
       display: none;
@@ -143,21 +161,28 @@
 </div>
 
 <div id="viewer"></div>
-<div id="no-epub"><span>No EPUB loaded</span><span id="no-epub-hint"></span></div>
+<div id="pdf-viewer"></div>
+<div id="no-epub"><span>No book loaded</span><span id="no-epub-hint"></span></div>
 <div id="footer" id="footer"></div>
 <div id="overlay">Disconnected — reconnecting…</div>
 
 <script src="/jszip.min.js"></script>
 <script src="/epub.min.js"></script>
+<script src="/pdf.min.js"></script>
 <script>
 'use strict';
 
 // ── App state ──────────────────────────────────────────────────────────────
 
-let currentMode   = 'Init';
-let rendition     = null;
-let bookLoaded    = false;
+let currentMode     = 'Init';
+let rendition       = null;
+let bookLoaded      = false;
 let currentEpubPath = null;
+let currentPdfPath  = null;
+let pdfLoadingPath  = null;
+let pdfDoc          = null;   // cached pdfjsLib document
+let pdfZoom         = 1.5;    // scale multiplier relative to fit-width
+let pdfRenderGen    = 0;      // incremented on each render to abort stale renders
 
 // ── WebSocket ──────────────────────────────────────────────────────────────
 
@@ -181,7 +206,7 @@ function connect() {
     currentMode = state.mode || 'Init';
     updateStatusBar(state);
     updateFooter(state);
-    handleStateEpub(state);
+    handleStateBook(state);
   };
 
   ws.onclose = () => {
@@ -201,7 +226,7 @@ fetch('/state')
     currentMode = state.mode || 'Init';
     updateStatusBar(state);
     updateFooter(state);
-    handleStateEpub(state);
+    handleStateBook(state);
   })
   .catch(() => {});
 
@@ -214,7 +239,7 @@ connect();
 
 const ABSORB = new Set(['Space', 'Enter', 'KeyP', 'KeyJ', 'KeyK', 'KeyL',
                         'KeyN', 'Escape', 'ArrowLeft', 'ArrowRight',
-                        'KeyE', 'KeyR', 'KeyQ']);
+                        'KeyE', 'KeyR', 'KeyQ', 'Minus', 'Equal']);
 
 document.addEventListener('keydown', e => {
   // Allow normal input when focus is inside a text field.
@@ -226,6 +251,10 @@ document.addEventListener('keydown', e => {
   // ← / → scroll the EPUB directly in the browser.
   if (key === 'ArrowRight') { if (rendition) rendition.next(); return; }
   if (key === 'ArrowLeft')  { if (rendition) rendition.prev(); return; }
+
+  // - / _ → zoom out PDF;  + / = → zoom in PDF (active whenever a PDF is shown).
+  if (currentPdfPath && key === 'Minus') { pdfZoom = Math.max(0.5, pdfZoom - 0.25); renderPdfPages(); return; }
+  if (currentPdfPath && key === 'Equal') { pdfZoom = Math.min(4.0, pdfZoom + 0.25); renderPdfPages(); return; }
 
   switch (currentMode) {
     case 'Standby':
@@ -319,28 +348,107 @@ function loadEpub() {
   });
 }
 
-function handleStateEpub(state) {
-  const viewer = document.getElementById('viewer');
-  const noEpub = document.getElementById('no-epub');
+function handleStateBook(state) {
+  const viewer    = document.getElementById('viewer');
+  const pdfViewer = document.getElementById('pdf-viewer');
+  const noEpub    = document.getElementById('no-epub');
 
-  if (!state.epub_path) {
-    viewer.style.display = 'none';
-    noEpub.classList.add('visible');
-    document.getElementById('no-epub-hint').textContent =
-      state.book ? `(add a .epub file to the ${state.book}/ directory)` : '';
-    rendition = null;
-    bookLoaded = false;
-    currentEpubPath = null;
+  if (state.epub_path) {
+    // ── EPUB path (unchanged behavior) ──────────────────────────────────────
+    pdfViewer.classList.remove('visible');
+    noEpub.classList.remove('visible');
+    currentPdfPath = null;
+    pdfLoadingPath = null;
+
+    if (state.epub_path !== currentEpubPath) {
+      currentEpubPath = state.epub_path;
+      bookLoaded = false;
+      if (rendition) { try { rendition.destroy(); } catch {} }
+      viewer.innerHTML = '';
+      viewer.style.display = 'block';
+      loadEpub();
+    }
     return;
   }
 
-  // Reload when the book changes.
-  if (state.epub_path !== currentEpubPath) {
-    currentEpubPath = state.epub_path;
-    bookLoaded = false;
-    if (rendition) { try { rendition.destroy(); } catch {} }
-    viewer.innerHTML = '';
-    loadEpub();
+  // No EPUB — hide EPUB viewer.
+  viewer.style.display = 'none';
+  if (rendition) { try { rendition.destroy(); } catch {} rendition = null; }
+  bookLoaded = false;
+  currentEpubPath = null;
+  pdfDoc = null;
+
+  if (state.pdf_path) {
+    // ── PDF path ─────────────────────────────────────────────────────────────
+    noEpub.classList.remove('visible');
+
+    if (state.pdf_path !== currentPdfPath) {
+      currentPdfPath = state.pdf_path;
+      pdfViewer.innerHTML = '';
+      pdfViewer.classList.add('visible');
+      loadPdf();
+    }
+    return;
+  }
+
+  // ── Neither — show placeholder ────────────────────────────────────────────
+  pdfViewer.classList.remove('visible');
+  currentPdfPath = null;
+  pdfLoadingPath = null;
+  noEpub.classList.add('visible');
+  document.getElementById('no-epub-hint').textContent =
+    state.book ? `(add a .epub or .pdf file to the ${state.book}/ directory)` : '';
+}
+
+async function loadPdf() {
+  const pathAtStart = currentPdfPath;
+  pdfLoadingPath = pathAtStart;
+  pdfDoc = null;
+
+  pdfjsLib.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.js';
+
+  try {
+    pdfDoc = await pdfjsLib.getDocument('/pdf').promise;
+  } catch (err) {
+    console.warn('PDF load error:', err);
+    return;
+  }
+
+  // Bail if the book changed while we were fetching.
+  if (pdfLoadingPath !== pathAtStart) return;
+
+  await renderPdfPages();
+}
+
+async function renderPdfPages() {
+  if (!pdfDoc) return;
+
+  const gen       = ++pdfRenderGen;
+  const pdfViewer = document.getElementById('pdf-viewer');
+  pdfViewer.innerHTML = '';
+
+  const dpr = window.devicePixelRatio || 1;
+
+  for (let pageNum = 1; pageNum <= pdfDoc.numPages; pageNum++) {
+    if (pdfRenderGen !== gen) return; // aborted by a newer render
+
+    const page     = await pdfDoc.getPage(pageNum);
+    const viewport = page.getViewport({ scale: 1 });
+
+    // Fit to container width, then apply the user's zoom multiplier.
+    const cssW   = (pdfViewer.clientWidth || 800) * pdfZoom;
+    const scale  = (cssW / viewport.width) * dpr;
+    const vp     = page.getViewport({ scale });
+
+    const canvas = document.createElement('canvas');
+    const ctx    = canvas.getContext('2d');
+    canvas.width        = vp.width;
+    canvas.height       = vp.height;
+    canvas.style.width  = (vp.width  / dpr) + 'px';
+    canvas.style.height = (vp.height / dpr) + 'px';
+
+    pdfViewer.appendChild(canvas);
+    await page.render({ canvasContext: ctx, viewport: vp }).promise;
   }
 }
 

@@ -21,9 +21,12 @@ pub struct BrowserState {
     pub rms_dbfs: f32,
     /// True when the silence watchdog has fired (>15 s of silence while recording).
     pub silence_warning: bool,
-    /// Absolute filesystem path to the `.epub` file served by `GET /epub`.
+    /// Absolute filesystem path to the `.epub` file served by `GET /book/*`.
     /// `null` when no EPUB is loaded.
     pub epub_path: Option<String>,
+    /// Absolute filesystem path to the `.pdf` file served by `GET /pdf`.
+    /// Set only when `epub_path` is `None`. `null` when no PDF is loaded.
+    pub pdf_path: Option<String>,
     /// Absolute timeline position in seconds for the current chapter.
     /// During Playing this is the live playhead; otherwise it is the cursor.
     pub timeline_pos_secs: f64,
@@ -42,6 +45,7 @@ impl Default for BrowserState {
             rms_dbfs: -100.0,
             silence_warning: false,
             epub_path: None,
+            pdf_path: None,
             timeline_pos_secs: 0.0,
             footer_hints: String::new(),
         }
@@ -67,6 +71,7 @@ impl BrowserState {
             .unwrap_or(0.0);
 
         let epub_path = app.epub_path.as_ref().map(|p| p.to_string_lossy().into_owned());
+        let pdf_path  = app.pdf_path.as_ref().map(|p| p.to_string_lossy().into_owned());
 
         // Live playhead during Playing; cursor position otherwise.
         let timeline_pos_secs = app.playhead_pos();
@@ -90,6 +95,7 @@ impl BrowserState {
             rms_dbfs: app.last_rms_db,
             silence_warning: app.silence_warning,
             epub_path,
+            pdf_path,
             timeline_pos_secs,
             footer_hints,
         }
