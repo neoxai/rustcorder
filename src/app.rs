@@ -335,6 +335,11 @@ impl App {
                 let pos = self.session.timeline_pos;
                 self.begin_playing(pos);
             }
+            KeyCode::Char('p') | KeyCode::Char('P') => {
+                self.abort_background_check();
+                let new_pos = (self.session.timeline_pos - self.punch_back_time).max(0.0);
+                self.begin_playing(new_pos);
+            }
             KeyCode::Char('j') | KeyCode::Char('J') => self.standby_jump_back(),
             KeyCode::Char('k') | KeyCode::Char('K') => self.standby_jump_forward(),
             KeyCode::Char('n') | KeyCode::Char('N') => self.advance_chapter_cmd(),

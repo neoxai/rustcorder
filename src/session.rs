@@ -167,8 +167,8 @@ pub fn load() -> Option<Session> {
 
     Some(Session {
         book: book?,
-        chapter: chapter?,
-        part: part?,
+        chapter: chapter.unwrap_or(1),
+        part: part.unwrap_or(1),
         timeline_pos,
         base_dir: PathBuf::from("."),
     })
