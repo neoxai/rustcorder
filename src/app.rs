@@ -614,12 +614,15 @@ impl App {
         self.start_recording();
     }
 
-    /// P pressed during Playing: rewind punch_back_time and restart.
+    /// P pressed during Playing: rewind punch_back_time from the current live
+    /// playhead position and restart. Successive presses accumulate — each one
+    /// goes back an additional punch_back_time. Clamps to 0 (replays from start).
     fn rewind_playing(&mut self) {
+        let current_pos = self.playhead_origin + self.playback_elapsed_secs();
         if let Some(h) = self.playback.take() {
             h.stop();
         }
-        let new_origin = (self.playhead_origin - self.punch_back_time).max(0.0);
+        let new_origin = (current_pos - self.punch_back_time).max(0.0);
         self.begin_playing(new_origin);
     }
 
